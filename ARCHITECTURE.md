@@ -9,7 +9,9 @@ reader, to the SIMD loop that finds a term in a string column.
 |---|---|
 | `src/main.zig` | Command line; calls `search.run` |
 | `src/walk.zig` | Parallel recursive directory walk; knows nothing about searching |
-| `src/search.zig` | `run`: thread pool and walk. Per file: map, read messages, find string arrays, search batches in parallel, output |
+| `src/search.zig` | `run`: thread pool and walk. Per file: read messages, find string arrays, cut batches into pieces, search them in parallel, output |
+| `src/map.zig` | The file's bytes: map, close, and `release` parts that won't be read again |
+| `src/linux.zig` | Linux-only code (used by `map.zig`): dropping a part's pages early |
 | `src/arrow.zig` | Arrow IPC: messages, schema, record batch layout, buffers, string arrays, dictionary indices, nesting |
 | `src/flatbuf.zig` | A bounds-checked FlatBuffers reader for Arrow's metadata |
 | `src/lz4.zig` | LZ4 frame decompression (zstd comes from `std.compress.zstd`) |
@@ -37,15 +39,19 @@ The layers connect through small interfaces resolved at compile time
 
 ```
 walk.zig     one task per directory ──► visitFile ──► *.arrow, *.feather, *.arrows only
-search.zig   mmap ─► read messages in order ─► schema: find string arrays
-                                            ─► dictionary batch: search its values now
-                                            ─► record batch: queue a job
-             jobs in parallel (Io.Group) ─► each string array ─► match.findValues ─► map to row
-             report jobs in order, under the output mutex
+map.zig      mmap the file
+search.zig   read messages in order ─► schema: find string arrays
+                                    ─► dictionary batch: search its values now
+                                    ─► record batch: cut into pieces
+             pieces in parallel (Io.Group) ─► match.findValues ─► map to row
+                                           ─► batch's last piece done: release its pages
+             report pieces in order, under the output mutex
+map.zig      munmap (nothing left to tear down on Linux)
 ```
 
-1. **Map.** The file is `mmap`ed read-only (on Windows, read whole), so
-   uncompressed buffers are searched where they lie. Nothing is copied.
+1. **Map.** `map.Map` maps the file read-only (on Windows, reads it
+   whole), so uncompressed buffers are searched where they lie. Nothing is
+   copied.
 2. **Messages.** `arrow.Reader` reads the encapsulated messages in order:
    an optional `0xFFFFFFFF` continuation marker, a 32-bit metadata length,
    a FlatBuffers `Message`, then its body. The file format is the stream
@@ -61,16 +67,67 @@ search.zig   mmap ─► read messages in order ─► schema: find string array
    dictionary keys. A delta adds values; a replacement (streams only)
    starts over. Either way a *new* `Dictionary` object is made, so the
    batches already queued keep the dictionary that was current for them.
-5. **Record batches** become jobs. Each one records its first row in the
-   file and its dictionaries as they were at that point.
-6. **Jobs run in parallel** in an `Io.Group`, so one large file uses every
-   thread, not just one. With one batch the job runs inline. A job finds
-   its batch's buffers (`Batch.layout`), searches each target and writes
-   matches into its own buffer.
-7. **Report.** Under the output mutex the jobs' buffers are written in
-   batch order, so a file's matches come out together and in order. If
-   reading or a batch failed, the matches before that point are still
-   reported, then the error goes to stderr.
+5. **Record batches** are cut into *pieces* (see *Pieces* below). A
+   batch's `BatchWork` keeps its layout (`Batch.layout`), its first row
+   in the file and its dictionaries as they were at that point, and
+   all its pieces share it.
+6. **Pieces run in parallel** in an `Io.Group`. When every thread is busy,
+   `async` runs the piece inline, so the file's own thread works too. A
+   piece searches one string array, or a range of one, and writes matches
+   into its own buffer.
+7. **Release.** Each batch counts its unfinished pieces. The one that
+   brings the count to zero calls `map.release` on the batch's body (see
+   *Releasing pages* below).
+8. **Report.** Under the output mutex, the pieces' buffers are written in
+   order (batch, column, row), so a file's matches come out together and
+   in order. If reading or a piece failed, the matches before that point
+   are still reported, then the error goes to stderr.
+
+### Pieces
+
+A record batch is a poor unit of work: there may be fewer batches than
+threads, and batches of 1 M rows on 16 threads ran as two waves, the
+second of only 3 batches. So `FileSearch.cut` splits each batch by column
+and, for top-level string columns, by rows. Each piece of a column covers
+about `Options.piece_bytes` (8 MB) of offsets and data: the row count is
+the column's rows divided by `bytes / piece_bytes`. 8 MB was fastest in a
+sweep from 1 to 32 MB. Smaller pieces add overhead per piece; larger ones
+bring the uneven waves back.
+
+`Batch.stringRange` returns rows `from..to` of a string array, checking
+only that range's offsets or views. The values keep their absolute
+offsets into the data buffer, so `match.findValues` needs no change; the
+sink adds `Strings.first` to turn a value's index back into a row.
+
+These arrays are not cut, and are searched whole by one piece:
+- **nested** strings, whose leaf indices don't map to row ranges;
+- **dictionary-encoded** columns, which are one pass over small indices;
+- **compressed** batches, where every piece would decompress the whole
+  buffer;
+- arrays under 2 × `piece_bytes`, and anything malformed (the error then
+  comes from the search).
+
+### Releasing pages
+
+Closing a mapping is not free: `munmap` tears down every page-table entry
+on one thread, holding the process's memory-map lock exclusively. For the
+2.3 GB benchmark file that took 66 ms, about as long as searching it on
+16 threads, and it happened after the search was over.
+
+So as soon as a batch's last piece is done, `Map.release` hands its body
+back. On Linux, `linux.dropPages` calls `madvise(MADV_DONTNEED)` on the
+whole pages inside it. That takes the lock shared, so the threads drop
+their batches in parallel, while others are still searching, and the
+final `munmap` finds almost nothing left. Nothing reads a batch's body
+after its pieces finish: matches are copied into the pieces' buffers, and
+dictionary values live in their own messages. If something did read it,
+the page would simply be faulted back in from the page cache. Other systems
+do nothing on `release`; their pages go at `munmap`, as before.
+
+The OS-specific code is in `linux.zig` alone, and `map.zig` calls it behind
+a comptime `builtin.os.tag == .linux` check, so other targets never compile
+it. Prefaulting (`MAP_POPULATE`), huge pages and `MADV_SEQUENTIAL` were
+tried as well and didn't help; `MAP_POPULATE` was 2× slower.
 
 ## The Arrow reader (`src/arrow.zig`, `src/flatbuf.zig`)
 
@@ -313,7 +370,8 @@ by the SIMD scan (the `a` and `b` windows, the second mostly from L1). The
 offsets are read once, by the check before searching. Per hit there is a
 binary search over the offsets. Validity bitmaps are read only for hits.
 
-On the 2.3 GB benchmark file, fds takes about 125 ms with 16 threads.
-That is about 18 GB/s, with 260 ms of system time spread over the threads,
-mostly page faults on the mapping. The matcher alone, on data already in
-memory, runs at about 23 GB/s on one core.
+On the 2.3 GB benchmark file, fds takes about 65–70 ms with 16 threads,
+about 35 GB/s. The search pieces read at about 50 GB/s together, close to
+this machine's memory bandwidth, and system time is mostly page faults on
+the mapping. The matcher alone, on data already in memory, runs at about
+23 GB/s on one core.

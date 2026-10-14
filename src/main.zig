@@ -16,7 +16,8 @@ const Regex = @import("regex.zig").Regex;
 //   main.zig    command line
 //   c_api.zig   the same search as a C library (include/fds.h)
 //   walk.zig    parallel recursive directory walk (one task per directory)
-//   search.zig  thread pool, per-file work: map, find string arrays, output
+//   search.zig  thread pool, per-file work: find string arrays, cut into pieces, output
+//   map.zig     the file's bytes: map, release parts early (linux.zig), close
 //   arrow.zig   Arrow IPC messages, schema and buffers (flatbuf.zig, lz4.zig)
 //   match.zig   finding the term in a string array (SIMD), no I/O
 //   regex.zig   regex: parser, Pike VM, SIMD literal prefilter
@@ -117,6 +118,7 @@ test {
     _ = @import("c_api.zig");
     _ = @import("flatbuf.zig");
     _ = @import("lz4.zig");
+    _ = @import("map.zig");
     _ = @import("match.zig");
     _ = @import("regex.zig");
     _ = @import("search.zig");

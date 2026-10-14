@@ -13,7 +13,9 @@ First release.
 - IPC file and stream formats; LZ4-frame and zstd body compression;
   dictionary deltas and replacements. Built-in LZ4 decoder, no dependencies.
 - `-c/--column NAME` (repeatable) limits the search to some columns.
-- Record batches of one file are searched in parallel.
+- Large files use every thread: batches are cut into pieces of about 8 MB
+  of one column, searched in parallel. On Linux each batch's pages are
+  released as soon as it is done, so closing a large file costs nothing.
 - Values may contain newlines, and so may the term. In `-E` regexes, `\n` and
   `\r` are escapes, `^`/`$` match at the value's start and end, and `\s`
   includes `\n`.

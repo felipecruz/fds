@@ -280,6 +280,13 @@ pub const Batch = struct {
         return b.nodes.int(i64, col.node, 8);
     }
 
+    /// The stored (maybe compressed) length of buffer `i`.
+    pub fn bufferLen(b: *const Batch, i: usize) Error!usize {
+        const length = try b.buffers.int(i64, i, 8);
+        if (length < 0) return error.Malformed;
+        return @intCast(length);
+    }
+
     /// Buffer `i` of the body, decompressed if needed (into `arena`).
     pub fn buffer(b: *const Batch, arena: Allocator, i: usize) Error![]const u8 {
         const offset = try b.buffers.int(i64, i, 0);
@@ -315,17 +322,26 @@ pub const Batch = struct {
 
     /// The values of a string array (`utf8`, `large_utf8` or `utf8_view`).
     pub fn strings(b: *const Batch, arena: Allocator, type_id: TypeId, col: Column) Error!Strings {
-        const n = try b.len(col);
+        return b.stringRange(arena, type_id, col, 0, try b.len(col));
+    }
+
+    /// Values `from..to` of a string array. Only that range's offsets or
+    /// views are checked, so a column can be searched in pieces without
+    /// each piece checking all of it. Uncompressed buffers only cost a
+    /// slice; compressed ones are decompressed whole on every call.
+    pub fn stringRange(b: *const Batch, arena: Allocator, type_id: TypeId, col: Column, from: usize, to: usize) Error!Strings {
+        if (from > to or to > try b.len(col)) return error.Malformed;
+        const n = to - from;
         const valid = try b.validity(arena, col);
         switch (type_id) {
-            .utf8 => return .{ .len = n, .validity = valid, .values = .{ .small = try offsetValues(i32, try b.buffer(arena, col.buffer + 1), n, try b.buffer(arena, col.buffer + 2)) } },
-            .large_utf8 => return .{ .len = n, .validity = valid, .values = .{ .large = try offsetValues(i64, try b.buffer(arena, col.buffer + 1), n, try b.buffer(arena, col.buffer + 2)) } },
+            .utf8 => return .{ .len = n, .validity = valid, .first = from, .values = .{ .small = try offsetValues(i32, try b.buffer(arena, col.buffer + 1), from, to, try b.buffer(arena, col.buffer + 2)) } },
+            .large_utf8 => return .{ .len = n, .validity = valid, .first = from, .values = .{ .large = try offsetValues(i64, try b.buffer(arena, col.buffer + 1), from, to, try b.buffer(arena, col.buffer + 2)) } },
             .utf8_view => {
                 const views = try b.buffer(arena, col.buffer + 1);
-                if (views.len / 16 < n) return error.Malformed;
+                if (views.len / 16 < to) return error.Malformed;
                 const data = try arena.alloc([]const u8, col.variadic);
                 for (data, 0..) |*d, i| d.* = try b.buffer(arena, col.buffer + 2 + i);
-                const s: Strings = .{ .len = n, .validity = valid, .values = .{ .view = .{ .views = views[0 .. 16 * n], .data = data } } };
+                const s: Strings = .{ .len = n, .validity = valid, .first = from, .values = .{ .view = .{ .views = views[16 * from .. 16 * to], .data = data } } };
                 for (0..n) |i| try s.checkView(i);
                 return s;
             },
@@ -349,8 +365,8 @@ pub const Batch = struct {
         return .{ .len = n, .validity = valid, .children = switch (f.type) {
             .@"struct" => .same,
             .fixed_size_list => .{ .fixed = f.list_size },
-            .list, .map => .{ .small = try offsets(i32, try b.buffer(arena, col.buffer + 1), n) },
-            .large_list => .{ .large = try offsets(i64, try b.buffer(arena, col.buffer + 1), n) },
+            .list, .map => .{ .small = try offsets(i32, try b.buffer(arena, col.buffer + 1), 0, n) },
+            .large_list => .{ .large = try offsets(i64, try b.buffer(arena, col.buffer + 1), 0, n) },
             else => unreachable,
         } };
     }
@@ -375,17 +391,19 @@ fn unzstd(arena: Allocator, src: []const u8, n: usize) Error![]const u8 {
 }
 
 // `n + 1` offsets, checked to be non-decreasing and non-negative.
-fn offsets(comptime O: type, bytes: []const u8, n: usize) Error![]align(1) const O {
-    if (bytes.len / @sizeOf(O) < n + 1) return error.Malformed;
-    const off = std.mem.bytesAsSlice(O, bytes[0 .. (n + 1) * @sizeOf(O)]);
+// Offsets `from..to + 1` (the bounds of values `from..to`), checked to be
+// non-decreasing and non-negative.
+fn offsets(comptime O: type, bytes: []const u8, from: usize, to: usize) Error![]align(1) const O {
+    if (bytes.len / @sizeOf(O) < to + 1) return error.Malformed;
+    const off = std.mem.bytesAsSlice(O, bytes[from * @sizeOf(O) .. (to + 1) * @sizeOf(O)]);
     if (off[0] < 0) return error.Malformed;
-    for (off[0..n], off[1..]) |a, z| if (z < a) return error.Malformed;
+    for (off[0 .. off.len - 1], off[1..]) |a, z| if (z < a) return error.Malformed;
     return off;
 }
 
-fn offsetValues(comptime O: type, bytes: []const u8, n: usize, data: []const u8) Error!Offsets(O) {
-    const off = try offsets(O, bytes, n);
-    if (off[n] > data.len) return error.Malformed;
+fn offsetValues(comptime O: type, bytes: []const u8, from: usize, to: usize, data: []const u8) Error!Offsets(O) {
+    const off = try offsets(O, bytes, from, to);
+    if (off[off.len - 1] > data.len) return error.Malformed;
     return .{ .off = off, .data = data };
 }
 
@@ -398,11 +416,13 @@ pub fn validBit(bits: []const u8, i: usize) bool {
     return bits.len == 0 or bits[i >> 3] & (@as(u8, 1) << @intCast(i & 7)) != 0;
 }
 
-/// A string array. Every offset and view is checked when it is built, so
-/// `get` can't go out of bounds.
+/// A string array, or a range of one. Every offset and view is checked
+/// when it is built, so `get` can't go out of bounds. Indices are relative
+/// to the range: value `i` is row `first + i` of the array.
 pub const Strings = struct {
     len: usize,
-    validity: []const u8, // "" if no value is null
+    validity: []const u8, // of the whole array; "" if no value is null
+    first: usize = 0,
     values: union(enum) {
         small: Offsets(i32), // utf8
         large: Offsets(i64), // large_utf8
@@ -410,7 +430,7 @@ pub const Strings = struct {
     },
 
     pub fn isValid(s: Strings, i: usize) bool {
-        return validBit(s.validity, i);
+        return validBit(s.validity, s.first + i);
     }
 
     pub fn get(s: Strings, i: usize) []const u8 {

@@ -5,7 +5,8 @@
 
 A command-line tool and a C library, with no dependencies. Two ideas:
 
-1. **Threads:** one task per directory, and one per record batch inside a file.
+1. **Threads:** one task per directory, and inside a file one per piece:
+   about 8 MB of one string column.
 2. **SIMD:** compare 32 bytes at a time (16 on NEON) over a whole string
    column in one pass.
 
@@ -23,16 +24,16 @@ cache, AMD Ryzen 9 6950H (8 cores, 16 threads), Linux. All three tools use
 
 | Search (all string columns) | **fds** | DuckDB 1.5 | polars 2.0 |
 |:---|---:|---:|---:|
-| Rare `host-4242.example` (3,989 rows) | **131 ms** | 230 ms | 488 ms |
-| No match `zqxjv` | **124 ms** | 195 ms | 485 ms |
-| Common `checkout` (4.4 M rows) | **215 ms** | 256 ms | 500 ms |
-| Regex `timeout [a-z]+ token` | **360 ms** | — | 519 ms |
+| Rare `host-4242.example` (3,989 rows) | **74 ms** | 230 ms | 488 ms |
+| No match `zqxjv` | **71 ms** | 195 ms | 485 ms |
+| Common `checkout` (4.4 M rows) | **174 ms** | 256 ms | 500 ms |
+| Regex `timeout [a-z]+ token` | **285 ms** | — | 519 ms |
 
-- **About 18 GB/s on an uncompressed file.** The matcher alone runs at
-  about 23 GB/s per core, and one thread gets through the whole file in
-  203 ms. Past that, the limit is page faults on the mapped file.
+- **About 33 GB/s on an uncompressed file**, close to the memory bandwidth
+  of this laptop. The matcher alone runs at about 23 GB/s per core, and
+  one thread gets through the whole file in 192 ms.
 - **Compressed files cost more:** the same table as LZ4 Feather (1.1 GB)
-  takes 347 ms, almost all of it decompression.
+  takes 325 ms, almost all of it decompression.
 - Each match is printed as one line (4.5 million of them for `checkout`),
   where DuckDB and polars only count rows.
 

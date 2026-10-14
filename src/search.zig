@@ -10,13 +10,19 @@
 //! path such as `user.name` or `tags[]`.
 //!
 //! A file's messages are read in order on one thread (dictionaries must be
-//! searched before the batches that use them); then its record batches are
-//! searched in parallel, and their matches are reported in batch order.
+//! searched before the batches that use them), and its record batches are
+//! cut into pieces of similar size: a range of rows of one top-level
+//! string column (about `Options.piece_bytes` of strings), or a whole nested,
+//! dictionary-encoded or compressed array. Pieces are searched in
+//! parallel, so the threads finish together, and their matches are
+//! reported in order: by batch, column, then row. When a batch's last piece
+//! is done, its part of the file is released (`map.Map.release`).
 
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 const arrow = @import("arrow.zig");
+const Map = @import("map.zig").Map;
 const match = @import("match.zig");
 const regex = @import("regex.zig");
 const walk = @import("walk.zig");
@@ -34,6 +40,9 @@ pub const Options = struct {
     /// Search only these columns: a top-level name, or a full path such as
     /// `user.name`. Empty: every string column.
     columns: []const []const u8 = &.{},
+    /// About how many bytes of strings one piece of a column holds (see
+    /// the top of this file). Tests make it small to cut columns finely.
+    piece_bytes: usize = 8 << 20,
 };
 
 /// The default thread count: the number of performance cores
@@ -138,15 +147,15 @@ pub const Searcher = struct {
     pub fn searchFile(s: *Searcher, dir: Io.Dir, name: []const u8, path: []const u8) !void {
         const file = dir.openFile(s.io, name, .{}) catch |err| return warn(path, err);
         defer file.close(s.io);
-        const bytes = mapFile(s.io, s.gpa, file) catch |err| return warn(path, err);
-        defer unmapFile(s.gpa, bytes);
-        s.searchBytes(path, bytes) catch |err| switch (err) {
+        const map = Map.open(s.io, s.gpa, file) catch |err| return warn(path, err);
+        defer map.close(s.gpa);
+        s.searchMap(path, map) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
             else => warn(path, err),
         };
     }
 
-    fn searchBytes(s: *Searcher, path: []const u8, bytes: []const u8) !void {
+    fn searchMap(s: *Searcher, path: []const u8, map: Map) !void {
         var arena_state: std.heap.ArenaAllocator = .init(s.gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
@@ -154,66 +163,73 @@ pub const Searcher = struct {
         var vm: ?regex.Vm = if (s.opts.regex) |re| try .init(s.gpa, re) else null;
         defer if (vm) |*v| v.deinit(s.gpa);
 
-        var f: FileSearch = .{ .s = s, .path = path };
-        defer for (f.jobs.items) |*j| j.deinit(s.gpa);
+        var f: FileSearch = .{ .s = s, .path = path, .map = map };
+        defer for (f.pieces.items) |*p| p.deinit(s.gpa);
         // On an error, the batches read before it are still searched.
-        const read_err = f.read(arena, bytes, .{ .opts = &s.opts, .vm = if (vm) |*v| v else null });
-        if (f.jobs.items.len == 1) {
-            s.runJob(&f, &f.jobs.items[0]);
-        } else if (f.jobs.items.len > 1) {
+        const read_err = f.read(arena, .{ .opts = &s.opts, .vm = if (vm) |*v| v else null });
+        if (f.pieces.items.len == 1) {
+            s.runPiece(&f, &f.pieces.items[0]);
+        } else if (f.pieces.items.len > 1) {
             var group: Io.Group = .init;
             defer group.cancel(s.io);
-            for (f.jobs.items) |*j| group.async(s.io, runJobTask, .{ s, &f, j });
+            for (f.pieces.items) |*p| group.async(s.io, runPieceTask, .{ s, &f, p });
             try group.await(s.io);
         }
         try s.report(&f);
         return read_err;
     }
 
-    fn runJobTask(s: *Searcher, f: *const FileSearch, job: *Job) Io.Cancelable!void {
-        s.runJob(f, job);
+    fn runPieceTask(s: *Searcher, f: *const FileSearch, piece: *Piece) Io.Cancelable!void {
+        s.runPiece(f, piece);
     }
 
-    fn runJob(s: *Searcher, f: *const FileSearch, job: *Job) void {
+    fn runPiece(s: *Searcher, f: *const FileSearch, piece: *Piece) void {
+        defer {
+            // The batch's last piece: nothing reads its body any more
+            // (matches were copied out, dictionaries live elsewhere).
+            if (piece.batch.pending.fetchSub(1, .acq_rel) == 1) f.map.release(piece.batch.batch.body);
+        }
         var scratch: std.heap.ArenaAllocator = .init(s.gpa);
         defer scratch.deinit();
         var vm: ?regex.Vm = if (s.opts.regex) |re| regex.Vm.init(s.gpa, re) catch |err| {
-            job.err = err;
+            piece.err = err;
             return;
         } else null;
         defer if (vm) |*v| v.deinit(s.gpa);
         const matcher: Matcher = .{ .opts = &s.opts, .vm = if (vm) |*v| v else null };
-        s.searchBatch(scratch.allocator(), f, job, matcher) catch |err| {
-            job.err = err;
+        s.searchPiece(scratch.allocator(), f, piece, matcher) catch |err| {
+            piece.err = err;
         };
     }
 
-    fn searchBatch(s: *Searcher, arena: std.mem.Allocator, f: *const FileSearch, job: *Job, matcher: Matcher) !void {
-        const columns = try job.batch.layout(arena, f.schema);
-        for (f.targets, job.dicts, 0..) |*t, dict, ti| {
-            if (s.stopped.load(.monotonic)) return;
-            const levels = try arena.alloc(arrow.Level, t.path.len);
-            for (t.path, levels) |field, *l| l.* = try job.batch.level(arena, field, columns[field.index]);
-            const cursors = try arena.alloc(usize, t.path.len);
-            @memset(cursors, 0);
-            var sink: Sink = .{ .s = s, .f = f, .job = job, .target = ti, .levels = levels, .cursors = cursors };
+    fn searchPiece(s: *Searcher, arena: std.mem.Allocator, f: *const FileSearch, piece: *Piece, matcher: Matcher) !void {
+        if (s.stopped.load(.monotonic)) return;
+        const b = piece.batch;
+        const t = &f.targets[piece.target];
+        const levels = try arena.alloc(arrow.Level, t.path.len);
+        for (t.path, levels) |field, *l| l.* = try b.batch.level(arena, field, b.columns[field.index]);
+        const cursors = try arena.alloc(usize, t.path.len);
+        @memset(cursors, 0);
+        var sink: Sink = .{ .s = s, .f = f, .piece = piece, .levels = levels, .cursors = cursors };
 
-            const col = columns[t.leaf.index];
-            if (t.leaf.dict) |d| {
-                const ix = try job.batch.indices(arena, d, col);
-                const values = dict orelse return error.Malformed; // no dictionary batch for it
-                if (!values.any) continue;
-                for (0..ix.len) |i| {
-                    if (!arrow.validBit(ix.validity, i)) continue;
-                    const key = ix.get(i) orelse return error.Malformed;
-                    if (key >= values.len) return error.Malformed;
-                    if (values.matches.isSet(@intCast(key))) try sink.onValue(i, values.get(@intCast(key)));
-                }
-            } else {
-                const strings = try job.batch.strings(arena, t.leaf.type, col);
-                sink.validity = strings.validity;
-                try matcher.findStrings(strings, &sink);
+        const col = b.columns[t.leaf.index];
+        if (t.leaf.dict) |d| {
+            const ix = try b.batch.indices(arena, d, col);
+            const values = b.dicts[piece.target] orelse return error.Malformed; // no dictionary batch for it
+            if (!values.any) return;
+            for (0..ix.len) |i| {
+                if (!arrow.validBit(ix.validity, i)) continue;
+                const key = ix.get(i) orelse return error.Malformed;
+                if (key >= values.len) return error.Malformed;
+                if (values.matches.isSet(@intCast(key))) try sink.onValue(i, values.get(@intCast(key)));
             }
+        } else {
+            const strings = if (piece.rows) |r|
+                try b.batch.stringRange(arena, t.leaf.type, col, r.from, r.to)
+            else
+                try b.batch.strings(arena, t.leaf.type, col);
+            sink.strings = strings;
+            try matcher.findStrings(strings, &sink);
         }
     }
 
@@ -221,21 +237,21 @@ pub const Searcher = struct {
     fn report(s: *Searcher, f: *FileSearch) !void {
         try s.out_mutex.lock(s.io);
         defer s.out_mutex.unlock(s.io);
-        for (f.jobs.items) |*j| {
+        for (f.pieces.items) |*j| {
             switch (s.output) {
                 .print => try s.writer.writeAll(j.out.written()),
                 .callback => |cb| for (j.hits.items) |h| {
                     if (s.stopped.load(.monotonic)) return;
                     const hit: Hit = .{
                         .path = f.path,
-                        .column = f.targets[h.target].name,
+                        .column = f.targets[j.target].name,
                         .row = h.row,
                         .text = j.out.written()[h.start..][0..h.len],
                     };
                     if (!cb.f(cb.ctx, hit)) s.stopped.store(true, .monotonic);
                 },
             }
-            // A batch that failed: later batches are not reported.
+            // A piece that failed: later pieces are not reported.
             if (j.err) |err| return warn(f.path, err);
         }
     }
@@ -245,14 +261,15 @@ pub const Searcher = struct {
 const FileSearch = struct {
     s: *Searcher,
     path: []const u8,
+    map: Map,
     schema: arrow.Schema = undefined,
     targets: []const Target = &.{},
-    jobs: std.ArrayList(Job) = .empty, // one per record batch, in order
+    pieces: std.ArrayList(Piece) = .empty, // in output order
 
     // Reads the file's messages: the schema, then dictionaries (searched
-    // here) and record batches (queued as jobs).
-    fn read(f: *FileSearch, arena: std.mem.Allocator, bytes: []const u8, matcher: Matcher) !void {
-        var reader = try arrow.Reader.init(bytes);
+    // here) and record batches (cut into pieces).
+    fn read(f: *FileSearch, arena: std.mem.Allocator, matcher: Matcher) !void {
+        var reader = try arrow.Reader.init(f.map.bytes);
         var have_schema = false;
         var dicts: std.AutoHashMapUnmanaged(i64, *const Dictionary) = .empty;
         var rows: u64 = 0;
@@ -282,13 +299,53 @@ const FileSearch = struct {
                 // or delta makes a new `Dictionary`, never changes this one.
                 const snapshot = try arena.alloc(?*const Dictionary, f.targets.len);
                 for (f.targets, snapshot) |t, *d| d.* = if (t.leaf.dict) |dd| dicts.get(dd.id) else null;
-                try f.jobs.append(arena, .{ .batch = batch, .first_row = rows, .dicts = snapshot, .out = .init(f.s.gpa) });
+                const b = try arena.create(BatchWork);
+                b.* = .{ .batch = batch, .first_row = rows, .dicts = snapshot, .columns = try batch.layout(arena, f.schema) };
+                try f.cut(arena, b);
                 rows += batch.length;
             },
             .other => {},
         };
     }
+
+    // Adds the pieces of a batch, in output order.
+    fn cut(f: *FileSearch, arena: std.mem.Allocator, b: *BatchWork) !void {
+        const first = f.pieces.items.len;
+        for (f.targets, 0..) |t, ti| {
+            const rows = rowsPerPiece(b, t, f.s.opts.piece_bytes) orelse {
+                try f.pieces.append(arena, .{ .batch = b, .target = ti, .rows = null, .out = .init(f.s.gpa) });
+                continue;
+            };
+            const n = b.batch.len(b.columns[t.leaf.index]) catch unreachable; // rowsPerPiece checked it
+            var from: usize = 0;
+            while (from < n) : (from += rows) {
+                const range: Rows = .{ .from = from, .to = @min(n, from + rows) };
+                try f.pieces.append(arena, .{ .batch = b, .target = ti, .rows = range, .out = .init(f.s.gpa) });
+            }
+        }
+        b.pending = .init(f.pieces.items.len - first);
+        // No pieces (no rows): nothing will release the batch, which is fine.
+    }
+
 };
+
+// How many rows of the target go in one piece, or null to search the array
+// whole: nested and dictionary-encoded arrays (their rows don't map to
+// ranges of the leaf array), compressed ones (each piece would decompress
+// all of it), small ones, and anything malformed (the error then comes from
+// the search).
+fn rowsPerPiece(b: *const BatchWork, t: Target, piece_bytes: usize) ?usize {
+    if (t.path.len > 0 or t.leaf.dict != null or b.batch.codec != null) return null;
+    const col = b.columns[t.leaf.index];
+    const n = b.batch.len(col) catch return null;
+    // The array's bytes: offsets and data, or views and their data buffers.
+    const buffers: usize = if (t.leaf.type == .utf8_view) 1 + col.variadic else 2;
+    var bytes: usize = 0;
+    for (0..buffers) |i| bytes += b.batch.bufferLen(col.buffer + 1 + i) catch return null;
+    const pieces = bytes / piece_bytes;
+    if (pieces < 2 or n < 2) return null;
+    return std.math.divCeil(usize, n, pieces) catch unreachable;
+}
 
 // A string array to search, found in the schema.
 const Target = struct {
@@ -355,7 +412,7 @@ const Dictionary = struct {
             var it = p.matches.iterator(.{});
             while (it.next()) |k| d.matches.set(k);
         }
-        try matcher.findStrings(strings, DictSink{ .d = d, .base = base, .validity = strings.validity });
+        try matcher.findStrings(strings, DictSink{ .d = d, .base = base, .strings = strings });
         d.any = d.matches.count() > 0;
         return d;
     }
@@ -369,9 +426,9 @@ const Dictionary = struct {
     const DictSink = struct {
         d: *Dictionary,
         base: usize,
-        validity: []const u8,
+        strings: arrow.Strings,
         pub fn onValue(k: DictSink, i: usize, _: []const u8) !void {
-            if (arrow.validBit(k.validity, i)) k.d.matches.set(k.base + i);
+            if (k.strings.isValid(i)) k.d.matches.set(k.base + i);
         }
     };
 };
@@ -406,50 +463,63 @@ const Matcher = struct {
     }
 };
 
-// One record batch to search, and its results.
-const Job = struct {
+// One record batch, shared by its pieces.
+const BatchWork = struct {
     batch: arrow.Batch,
     first_row: u64, // file row of the batch's row 0
     dicts: []const ?*const Dictionary, // per target
+    columns: []const arrow.Column, // `batch.layout`
+    pending: std.atomic.Value(usize) = .init(0), // pieces not finished yet
+};
+
+const Rows = struct { from: usize, to: usize };
+
+// A part of a batch to search, and its results.
+const Piece = struct {
+    batch: *BatchWork,
+    target: usize,
+    rows: ?Rows, // a range of a top-level array, or null for all of it
     out: Io.Writer.Allocating, // `.print` lines, or `.callback` value texts
     hits: std.ArrayList(Collected) = .empty, // with `.callback` only
     err: ?anyerror = null,
 
-    fn deinit(j: *Job, gpa: std.mem.Allocator) void {
-        j.out.deinit();
-        j.hits.deinit(gpa);
+    fn deinit(p: *Piece, gpa: std.mem.Allocator) void {
+        p.out.deinit();
+        p.hits.deinit(gpa);
     }
 };
 
-const Collected = struct { target: usize, row: u64, start: usize, len: usize };
+const Collected = struct { row: u64, start: usize, len: usize };
 
 // Receives the matching values of one string array, maps them up to their
 // top-level row and records them.
 const Sink = struct {
     s: *Searcher,
     f: *const FileSearch,
-    job: *Job,
-    target: usize,
+    piece: *Piece,
     levels: []const arrow.Level,
     cursors: []usize,
-    validity: []const u8 = "",
+    strings: ?arrow.Strings = null, // null: dictionary values, already checked for nulls
     last_row: ?u64 = null,
 
     pub fn onValue(k: *Sink, i: usize, value: []const u8) !void {
-        if (!arrow.validBit(k.validity, i)) return;
         var j = i;
+        if (k.strings) |strings| {
+            if (!strings.isValid(i)) return;
+            j = strings.first + i; // index in the whole array
+        }
         var level = k.levels.len;
         while (level > 0) {
             level -= 1;
             j = k.levels[level].parent(j, &k.cursors[level]) orelse return;
         }
-        const row = k.job.first_row + j;
+        const row = k.piece.batch.first_row + j;
         // Several list elements of one row: the row is reported once.
         if (k.last_row == row) return;
         k.last_row = row;
 
-        const name = k.f.targets[k.target].name;
-        const out = &k.job.out.writer;
+        const name = k.f.targets[k.piece.target].name;
+        const out = &k.piece.out.writer;
         switch (k.s.output) {
             .print => |p| {
                 try out.print("{s}:{s}:{d}", .{ k.f.path, name, row });
@@ -460,9 +530,9 @@ const Sink = struct {
                 try out.writeByte('\n');
             },
             .callback => {
-                const start = k.job.out.written().len;
+                const start = k.piece.out.written().len;
                 try out.writeAll(value);
-                try k.job.hits.append(k.s.gpa, .{ .target = k.target, .row = row, .start = start, .len = value.len });
+                try k.piece.hits.append(k.s.gpa, .{ .row = row, .start = start, .len = value.len });
             },
         }
     }
@@ -487,26 +557,6 @@ fn warn(path: []const u8, err: anyerror) void {
         else => @errorName(err),
     };
     std.debug.print("fds: {s}: {s}\n", .{ path, why });
-}
-
-// The whole file, read-only: mmap'd, or read into memory on Windows.
-fn mapFile(io: Io, gpa: std.mem.Allocator, file: Io.File) ![]const u8 {
-    const size = try file.length(io);
-    if (size == 0) return "";
-    if (size > std.math.maxInt(usize)) return error.FileTooBig;
-    if (builtin.os.tag == .windows) {
-        const buf = try gpa.alloc(u8, @intCast(size));
-        errdefer gpa.free(buf);
-        if (try file.readPositionalAll(io, buf, 0) != buf.len) return error.EndOfStream;
-        return buf;
-    }
-    return std.posix.mmap(null, @intCast(size), .{ .READ = true }, .{ .TYPE = .PRIVATE }, file.handle, 0);
-}
-
-fn unmapFile(gpa: std.mem.Allocator, bytes: []const u8) void {
-    if (bytes.len == 0) return;
-    if (builtin.os.tag == .windows) return gpa.free(bytes);
-    std.posix.munmap(@alignCast(bytes));
 }
 
 const testing = std.testing;
@@ -568,7 +618,10 @@ test "search the test files" {
         for (table_hits) |h| try expected.append(testing.allocator, try std.fmt.allocPrint(testing.allocator, "testdata/tree/{s}:{s}", .{ file, h }));
     }
     std.mem.sort([]const u8, expected.items, {}, CollectHits.lessThan);
-    try expectHits(.{ .root_path = "testdata/tree", .term = "needle", .jobs = 4 }, expected.items);
+    // Whole arrays, then pieces of a few rows, then of one row.
+    for ([_]usize{ 8 << 20, 64, 1 }) |piece_bytes| {
+        try expectHits(.{ .root_path = "testdata/tree", .term = "needle", .jobs = 4, .piece_bytes = piece_bytes }, expected.items);
+    }
 }
 
 test "search one file: columns, case, regex" {
