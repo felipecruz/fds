@@ -8,3 +8,6 @@ fixtures/
 # Local tool state and stray builds
 .aiflow/
 /fds
+
+# Python bytecode from the test scripts
+__pycache__/

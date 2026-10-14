@@ -605,7 +605,8 @@ const table_hits = [_][]const u8{
 
 test "search the test files" {
     // Plain, LZ4 and zstd files of the same table, a stream with dictionary
-    // deltas; notes.txt is skipped and truncated.arrow is reported.
+    // deltas, a file written by polars; notes.txt is skipped and
+    // truncated.arrow is reported.
     var expected: std.ArrayList([]const u8) = .empty;
     defer {
         for (expected.items) |e| testing.allocator.free(e);
@@ -613,6 +614,13 @@ test "search the test files" {
     }
     for ([_][]const u8{ "s:1:needle", "s:4:needle!", "s:5:needle", "s:7:needle-x" }) |h| {
         try expected.append(testing.allocator, try std.fmt.allocPrint(testing.allocator, "testdata/tree/deltas.arrows:{s}", .{h}));
+    }
+    const polars_hits = [_][]const u8{
+        "cat:1:needle",   "name:0:needle", "name:2:a long needle value past twelve bytes",
+        "st.inner:2:needle", "tags[]:1:needle",
+    };
+    for (polars_hits) |h| {
+        try expected.append(testing.allocator, try std.fmt.allocPrint(testing.allocator, "testdata/tree/polars.arrow:{s}", .{h}));
     }
     for ([_][]const u8{ "plain.arrow", "sub/lz4.feather", "sub/zstd.arrow" }) |file| {
         for (table_hits) |h| try expected.append(testing.allocator, try std.fmt.allocPrint(testing.allocator, "testdata/tree/{s}:{s}", .{ file, h }));

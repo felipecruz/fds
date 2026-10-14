@@ -3,11 +3,13 @@
 //! input is the whole file as bytes (mmap'd by search.zig), and buffers are
 //! slices of it unless they are compressed (LZ4 frame or zstd).
 //!
-//! Both formats are a sequence of messages (schema, dictionary batches,
-//! record batches); the file format adds magic bytes and a footer index,
-//! which is not needed to read the messages in order. Each message is a
-//! FlatBuffers header plus a body of buffers. Every offset and length read
-//! from the file is checked: a malformed file is `error.Malformed`.
+//! A stream is a sequence of messages (schema, dictionary batches, record
+//! batches), read in order. A file adds magic bytes and a footer, which
+//! holds the schema and the position of every dictionary and record batch;
+//! files are read through the footer, as other readers do, because writers
+//! don't all put a valid stream before it (polars doesn't). Each message
+//! is a FlatBuffers header plus a body of buffers. Every offset and length
+//! read from the file is checked: a malformed file is `error.Malformed`.
 //!
 //! Spec: https://arrow.apache.org/docs/format/Columnar.html
 
@@ -131,57 +133,120 @@ pub const Message = struct {
     body: []const u8,
 };
 
-/// Reads the messages of an IPC file or stream in order.
+/// Reads the messages of an IPC file or stream: the schema first, then
+/// dictionary batches and record batches, in the order a reader must
+/// apply them.
 pub const Reader = struct {
     bytes: []const u8,
-    pos: usize,
-    end: usize, // where messages end: the footer, or the end of a stream
+    source: union(enum) {
+        /// A stream: messages from `pos` to `end`, one after another.
+        stream: struct { pos: usize, end: usize },
+        /// A file: the footer's schema, then its blocks. `next` counts the
+        /// messages returned so far (the schema is message 0).
+        file: struct { schema: fb.Table, dictionaries: fb.Vector, batches: fb.Vector, next: usize = 0 },
+    },
 
     pub fn init(bytes: []const u8) Error!Reader {
         const magic = "ARROW1";
         if (std.mem.startsWith(u8, bytes, "FEA1")) return error.Unsupported; // Feather v1 (2016)
-        if (!std.mem.startsWith(u8, bytes, magic)) return .{ .bytes = bytes, .pos = 0, .end = bytes.len }; // a stream
+        if (!std.mem.startsWith(u8, bytes, magic)) return .{ .bytes = bytes, .source = .{ .stream = .{ .pos = 0, .end = bytes.len } } };
+
         // File: magic, padding, messages, footer, footer length, magic.
         if (bytes.len < 8 + 4 + magic.len or !std.mem.endsWith(u8, bytes, magic)) return error.Malformed;
-        const footer_len = try fb.readInt(i32, bytes, bytes.len - magic.len - 4);
-        const footer_start = @as(i64, @intCast(bytes.len - magic.len - 4)) - footer_len;
-        if (footer_len < 0 or footer_start < 8) return error.Malformed;
-        return .{ .bytes = bytes, .pos = 8, .end = @intCast(footer_start) };
+        const footer_end = bytes.len - magic.len - 4;
+        const footer_len = try fb.readInt(i32, bytes, footer_end);
+        if (footer_len < 0 or footer_len > footer_end - 8) return error.Malformed;
+        const footer = try fb.Table.root(bytes[footer_end - @as(usize, @intCast(footer_len)) .. footer_end]);
+        // Footer { version, schema, dictionaries: [Block], recordBatches: [Block] }
+        const empty: fb.Vector = .{ .buf = "", .start = 0, .len = 0, .elem_size = block_size };
+        return .{ .bytes = bytes, .source = .{ .file = .{
+            .schema = try footer.table(1) orelse return error.Malformed,
+            .dictionaries = try footer.vector(2, block_size) orelse empty,
+            .batches = try footer.vector(3, block_size) orelse empty,
+        } } };
     }
 
-    /// The next message, or null at the end-of-stream marker or the end.
+    // struct Block { offset: i64, metaDataLength: i32, (pad), bodyLength: i64 }
+    const block_size = 24;
+
+    /// The next message, or null at the end.
     pub fn next(r: *Reader) Error!?Message {
-        if (r.end - r.pos < 4) return null;
-        var len = try fb.readInt(u32, r.bytes, r.pos);
-        r.pos += 4;
+        switch (r.source) {
+            .stream => |*st| return r.nextInStream(&st.pos, st.end),
+            .file => |*f| {
+                defer f.next += 1;
+                if (f.next == 0) return .{ .kind = .schema, .header = f.schema, .body = "" };
+                const i = f.next - 1;
+                if (i < f.dictionaries.len) return try r.block(f.dictionaries, i, .dictionary);
+                if (i - f.dictionaries.len < f.batches.len) return try r.block(f.batches, i - f.dictionaries.len, .record_batch);
+                return null;
+            },
+        }
+    }
+
+    // A stream's next message, starting at `pos.*`; null at the
+    // end-of-stream marker or the end.
+    fn nextInStream(r: *Reader, pos: *usize, end: usize) Error!?Message {
+        if (end - pos.* < 4) return null;
+        var len = try fb.readInt(u32, r.bytes, pos.*);
+        pos.* += 4;
         if (len == 0xFFFF_FFFF) { // continuation marker, then the length
-            if (r.end - r.pos < 4) return null;
-            len = try fb.readInt(u32, r.bytes, r.pos);
-            r.pos += 4;
+            if (end - pos.* < 4) return null;
+            len = try fb.readInt(u32, r.bytes, pos.*);
+            pos.* += 4;
         }
         if (len == 0) return null; // end of stream
-        if (len > r.end - r.pos) return error.Malformed;
-        const message = try fb.Table.root(r.bytes[r.pos..][0..len]);
-        r.pos += len;
-
+        if (len > end - pos.*) return error.Malformed;
+        const meta = r.bytes[pos.*..][0..len];
+        pos.* += len;
+        const message = try fb.Table.root(meta);
         const body_len = try message.scalar(i64, 3, 0);
-        if (body_len < 0 or body_len > r.end - r.pos) return error.Malformed;
-        const body = r.bytes[r.pos..][0..@intCast(body_len)];
-        r.pos += body.len;
+        if (body_len < 0 or body_len > end - pos.*) return error.Malformed;
+        const body = r.bytes[pos.*..][0..@intCast(body_len)];
+        pos.* += body.len;
+        return try parseMessage(message, body);
+    }
 
-        const header = try message.table(2) orelse return .{ .kind = .other, .header = undefined, .body = body };
-        return .{
-            .kind = switch (try message.scalar(u8, 1, 0)) {
-                1 => .schema,
-                2 => .dictionary,
-                3 => .record_batch,
-                else => .other,
-            },
-            .header = header,
-            .body = body,
-        };
+    // The message at block `i` of a file's footer, which must be a `kind`.
+    fn block(r: *Reader, blocks: fb.Vector, i: usize, kind: @FieldType(Message, "kind")) Error!Message {
+        const offset = try blocks.int(i64, i, 0);
+        const meta_len = try blocks.int(i32, i, 8);
+        const body_len = try blocks.int(i64, i, 16);
+        if (offset < 0 or meta_len < 0 or body_len < 0 or offset > r.bytes.len) return error.Malformed;
+        const start: usize = @intCast(offset);
+        if (@as(usize, @intCast(meta_len)) > r.bytes.len - start) return error.Malformed;
+        const body_start = start + @as(usize, @intCast(meta_len));
+        if (@as(u64, @intCast(body_len)) > r.bytes.len - body_start) return error.Malformed;
+        // `metaDataLength` covers the length prefix (with or without a
+        // continuation marker), the message and its padding.
+        var pos = start;
+        var len = try fb.readInt(u32, r.bytes, pos);
+        pos += 4;
+        if (len == 0xFFFF_FFFF) {
+            len = try fb.readInt(u32, r.bytes, pos);
+            pos += 4;
+        }
+        if (pos > body_start or len > body_start - pos) return error.Malformed;
+        const msg = try parseMessage(try fb.Table.root(r.bytes[pos..][0..len]), r.bytes[body_start..][0..@intCast(body_len)]);
+        if (msg.kind != kind) return error.Malformed;
+        return msg;
     }
 };
+
+// Message { version, header_type, header, bodyLength, custom_metadata }
+fn parseMessage(message: fb.Table, body: []const u8) Error!Message {
+    const header = try message.table(2) orelse return .{ .kind = .other, .header = undefined, .body = body };
+    return .{
+        .kind = switch (try message.scalar(u8, 1, 0)) {
+            1 => .schema,
+            2 => .dictionary,
+            3 => .record_batch,
+            else => .other,
+        },
+        .header = header,
+        .body = body,
+    };
+}
 
 pub const DictionaryBatch = struct {
     id: i64,
@@ -300,8 +365,11 @@ pub const Batch = struct {
         const n = try fb.readInt(i64, raw, 0);
         if (n == -1) return raw[8..];
         if (n < 0 or n > 1 << 40) return error.Malformed;
+        // The length is only a claim: nothing is allocated for it up front
+        // beyond what the compressed bytes could produce.
         switch (codec) {
             .lz4 => {
+                if (n > lz4.maxDecompressedLen(raw.len - 8)) return error.Malformed;
                 const out = try arena.alloc(u8, @intCast(n));
                 lz4.decompress(raw[8..], out) catch return error.Malformed;
                 return out;
@@ -372,14 +440,16 @@ pub const Batch = struct {
     }
 };
 
-// Decompresses zstd frames that must produce exactly `n` bytes. Output is
-// limited to n + 1 bytes, so a bad length can't make it run away.
+// Decompresses zstd frames that must produce exactly `n` bytes. zstd has no
+// small maximum ratio, so the output buffer starts small and grows only as
+// bytes come out; output is limited to n + 1 bytes, so a frame can't run
+// past the claimed length either.
 fn unzstd(arena: Allocator, src: []const u8, n: usize) Error![]const u8 {
     const zstd = std.compress.zstd;
     var in: std.Io.Reader = .fixed(src);
     // The whole output stays in memory, so any window size fits.
     var d: zstd.Decompress = .init(&in, &.{}, .{ .window_len = 1 << 30 });
-    var out: std.Io.Writer.Allocating = try .initCapacity(arena, n + zstd.block_size_max);
+    var out: std.Io.Writer.Allocating = try .initCapacity(arena, @min(n, 16 * src.len + (1 << 16)) + zstd.block_size_max);
     while (out.written().len <= n) {
         _ = d.reader.stream(&out.writer, .limited(n + 1 - out.written().len)) catch |err| switch (err) {
             error.EndOfStream => break,
@@ -390,7 +460,6 @@ fn unzstd(arena: Allocator, src: []const u8, n: usize) Error![]const u8 {
     return out.written();
 }
 
-// `n + 1` offsets, checked to be non-decreasing and non-negative.
 // Offsets `from..to + 1` (the bounds of values `from..to`), checked to be
 // non-decreasing and non-negative.
 fn offsets(comptime O: type, bytes: []const u8, from: usize, to: usize) Error![]align(1) const O {

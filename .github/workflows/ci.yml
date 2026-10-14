@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Build and unit tests on Linux (x86-64) and macOS (Apple silicon).
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - run: zig build
+      - run: zig build test
+      - name: C example
+        run: zig build c-example -- testdata/tree needle
+      - name: Search the test files
+        run: zig-out/release/fds testdata/tree needle
+
+  # Differential and corruption tests against pyarrow, on both systems.
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install pyarrow polars
+      - run: zig build
+      - name: fds agrees with pyarrow on the test files
+        run: |
+          python testdata/check.py zig-out/release/fds testdata/tree needle
+          python testdata/check.py zig-out/release/fds testdata/tree NEEDLE -i
+      - name: Random tables
+        run: python testdata/fuzz.py zig-out/release/fds 300 ${{ github.run_number }}
+      - name: Corrupted files (debug build)
+        run: python testdata/mutate.py zig-out/debug/fds 1000 ${{ github.run_number }}

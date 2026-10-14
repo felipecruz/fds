@@ -1,6 +1,6 @@
 """Writes the Arrow test files used by `zig build test`.
 
-Usage: python3 testdata/make.py   (needs pyarrow; run from the project root)
+Usage: python3 testdata/make.py   (needs pyarrow and polars; run from the project root)
 
 Every file searches for "needle". The expected matches are listed in
 src/search.zig ("search the test files"); change both together.
@@ -79,6 +79,19 @@ def main():
         w.write_batch(batch(["a", "needle"], [0, 1, 0]))
         w.write_batch(batch(["a", "needle", "b", "needle!"], [2, 3, 1]))
         w.write_batch(batch(["z", "needle-x"], [0, 1]))
+
+    # polars has its own writer: string views everywhere, dictionaries of
+    # string views with uint32 indices, and a file layout pyarrow never
+    # writes (the region before the first block is not a valid stream, so
+    # readers must use the footer). Needle in name 0 and 2 (2 is longer than
+    # 12 bytes: not inline in its view), cat 1, tags[] 1 and st.inner 2.
+    import polars as pl
+    pl.DataFrame({
+        "name": ["needle", None, "a long needle value past twelve bytes", "x"],
+        "cat": pl.Series(["a", "needle", None, "a"], dtype=pl.Categorical),
+        "tags": [["x"], ["needle", "z"], None, []],
+        "st": [{"inner": "y"}, {"inner": "q"}, {"inner": "needle"}, None],
+    }).write_ipc(os.path.join(HERE, "tree", "polars.arrow"))
 
     # Not Arrow files: skipped by extension, or reported as malformed.
     with open(os.path.join(HERE, "tree", "notes.txt"), "w") as f:

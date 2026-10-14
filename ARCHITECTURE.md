@@ -52,12 +52,15 @@ map.zig      munmap (nothing left to tear down on Linux)
 1. **Map.** `map.Map` maps the file read-only (on Windows, reads it
    whole), so uncompressed buffers are searched where they lie. Nothing is
    copied.
-2. **Messages.** `arrow.Reader` reads the encapsulated messages in order:
-   an optional `0xFFFFFFFF` continuation marker, a 32-bit metadata length,
-   a FlatBuffers `Message`, then its body. The file format is the stream
-   format with `ARROW1` magic in front and a footer behind. The reader only
-   uses the footer's length to know where the messages stop, so both
-   formats share one path.
+2. **Messages.** `arrow.Reader` hands out the schema, then dictionary and
+   record batches. A *stream* is read in order: each message is an
+   optional `0xFFFFFFFF` continuation marker, a 32-bit metadata length, a
+   FlatBuffers `Message`, then its body. A *file* (`ARROW1` magic at both
+   ends) is read through its footer, which holds the schema and a block
+   (offset, metadata length, body length) for every dictionary and record
+   batch. The spec says a file holds a valid stream before the footer, but
+   polars writes something else there, and pyarrow never looks at it, so
+   the footer is the only reliable way in.
 3. **Schema → targets.** `findTargets` walks the schema and lists every
    string array to search (see *Targets* below). If there are none, the
    file is done: a table of numbers is skipped after reading its schema.
@@ -159,9 +162,12 @@ batches.
 compression, every non-empty buffer starts with its uncompressed length
 as an `i64` (-1 means it was stored uncompressed). The rest is one LZ4
 frame or zstd frame, decoded into memory that belongs to the job.
-Decompressed sizes are capped at 1 TiB, and the zstd output is capped at
-the declared length plus one byte, so a lying header can't make
-decompression run away.
+The declared length is only a claim, so nothing is allocated for it
+beyond what the compressed bytes could produce. LZ4 can't expand more than
+255×, so a larger claim is rejected before allocating anything. zstd has no
+such small bound, so its output buffer starts small and grows only as
+bytes come out, up to the claim plus one byte. Before this, a corrupted
+7.6 KB file could make fds allocate 48 GB (`testdata/mutate.py` found it).
 
 **Checks before searching.** `utf8` and `large_utf8` offsets are checked
 once per array: there must be n + 1 of them, non-negative and

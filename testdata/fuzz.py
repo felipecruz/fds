@@ -61,8 +61,11 @@ def rand_value(r, t):
 
 
 def is_string(t):
-    return pa.types.is_string(t) or pa.types.is_large_string(t) or pa.types.is_string_view(t) or (
-        pa.types.is_dictionary(t) and pa.types.is_string(t.value_type))
+    """A string array to search: string, large_string, string_view, or a
+    dictionary whose values are one of those."""
+    if pa.types.is_dictionary(t):
+        t = t.value_type
+    return pa.types.is_string(t) or pa.types.is_large_string(t) or pa.types.is_string_view(t)
 
 
 def hits(name, t, v, term, fold):

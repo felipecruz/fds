@@ -10,6 +10,13 @@ pub const Error = error{Malformed};
 
 const frame_magic = 0x184D2204;
 
+/// The most `src_len` bytes of LZ4 frames can decompress to. A sequence
+/// grows output fastest through its length bytes: each 255 adds 255 bytes,
+/// so output is at most 255 times the input, plus a little for headers.
+pub fn maxDecompressedLen(src_len: usize) usize {
+    return src_len *| 255 +| 64;
+}
+
 /// Decompresses the LZ4 frames in `src`, which must fill `dst` exactly.
 pub fn decompress(src: []const u8, dst: []u8) Error!void {
     var in: usize = 0;
@@ -120,4 +127,5 @@ test "decompress frames made by pyarrow" {
     for (0..frame.len) |n| try std.testing.expectError(error.Malformed, decompress(frame[0..n], &out));
     var short: [expected.len - 1]u8 = undefined;
     try std.testing.expectError(error.Malformed, decompress(frame, &short));
+    try std.testing.expect(expected.len <= maxDecompressedLen(frame.len));
 }

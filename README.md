@@ -50,6 +50,17 @@ cache, AMD Ryzen 9 6950H (8 cores, 16 threads), Linux. All three tools use
 The scripts are `bench/arrow.sh` and `bench/others.py`. The output
 matches DuckDB and polars row for row on all four searches.
 
+**Cold cache**, the same files on an NVMe drive (btrfs), evicted from the
+page cache before every run (DuckDB and polars each in a fresh process,
+timing only the query):
+
+| No-match search, cold | **fds** | DuckDB 1.5 | polars 2.0 |
+|:---|---:|---:|---:|
+| Uncompressed `.arrow` (2.3 GB) | **485 ms** | 692 ms | 867 ms |
+| LZ4 Feather (1.1 GB) | **561 ms** | 1,038 ms | 885 ms |
+
+Cold, fds reads at about 4.6 GB/s, the speed of the drive.
+
 ## What gets searched
 
 Every string value the schema has:
@@ -127,15 +138,20 @@ fds_search("data", "needle", FDS_IGNORE_CASE, 0, on_match, NULL);
 - Not supported: Feather v1 (2016) and big-endian files. Such files are
   reported on stderr and skipped.
 
+Checked against files written by pyarrow (`ipc`, `feather`, pandas
+`to_feather`), polars (`write_ipc`, `write_ipc_stream`; all compression
+and compat levels), Arrow JS, and the Hugging Face `datasets` cache
+(Arrow streams named `.arrow`), with `testdata/check.py`.
+
 A malformed file is reported (`fds: <path>: not a valid Arrow IPC file`) and
 skipped; matches found before the problem are still printed. Every offset
 read from a file is bounds-checked first.
 
 ## Limitations
 
-- **Tested on one Linux machine.** It builds for macOS and Windows, but
-  those builds have not been run on this version. On Windows the whole
-  file is read into memory instead of being mapped.
+- **Tested on Linux.** CI runs every test on macOS as well. Windows
+  builds have never been run; there the whole file is read into memory
+  instead of being mapped.
 - **A file truncated while it is being searched** can crash fds (SIGBUS),
   as with any tool that maps files.
 - **ASCII semantics.** `-i`, `\w` and `\b` are ASCII-only.
@@ -150,15 +166,25 @@ read from a file is bounds-checked first.
 - the regex VM against a backtracking reference matcher;
 - the LZ4 decoder on pyarrow output, with every truncation;
 - searches of `testdata/tree`: the same table stored plain, LZ4 and zstd,
-  plus a stream with dictionary deltas (`testdata/make.py` writes them);
+  a stream with dictionary deltas, and a file written by polars
+  (`testdata/make.py` writes them), whole and cut into tiny pieces;
 - the C API, called the way C would call it.
 
-`testdata/fuzz.py` is a differential test. It writes random tables (random
-string types, nesting, nulls, dictionaries, slices, batch sizes,
-compression, file or stream) and compares fds with a Python search over
-`to_pylist()`. 1,400 tables (about 11,000 matches) agree. Separately, 4,000
-randomly corrupted test files were run through the debug build, where any
-out-of-bounds access would panic; there were no crashes.
+Three scripts compare fds with pyarrow (they need `pyarrow`, and
+`polars` for `make.py`):
+
+- `testdata/check.py <fds> <path> <term>` reads every Arrow file under a
+  path with pyarrow, searches it in Python, and checks that fds prints
+  exactly the same matches and reports exactly the files pyarrow can't
+  read. Use it on your own data.
+- `testdata/fuzz.py <fds>` writes random tables (random string types,
+  nesting, nulls, dictionaries, slices, batch sizes, compression, file or
+  stream) and does the same check.
+- `testdata/mutate.py <debug fds>` corrupts the test files at random. fds
+  must not crash (the debug build panics on any out-of-bounds access),
+  hang or use more than 1 GB on any of them.
+
+CI (`.github/workflows/ci.yml`) runs all of it on Linux and macOS.
 
 ## More
 

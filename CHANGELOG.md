@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- Fixed: files written by polars (`write_ipc`) were rejected as malformed.
+  IPC files are now read through their footer, as other readers do.
+- Fixed: a corrupted compressed buffer could make fds allocate as much
+  memory as its header claimed (48 GB from a 7.6 KB file). Allocations are
+  now bounded by what the compressed bytes can produce.
+- `testdata/check.py` compares fds with pyarrow on any directory of Arrow
+  files; `testdata/mutate.py` corrupts files at random and checks fds
+  survives (no crash, hang or runaway memory).
+- Checked against files from pyarrow, pandas, polars, Arrow JS and the
+  Hugging Face `datasets` cache; cold-cache benchmarks on NVMe.
+- CI on Linux and macOS: unit tests, the C example, and the pyarrow checks.
+
 ## 0.0.7 — 2026-10-14
 
 First release.
