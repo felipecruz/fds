@@ -194,7 +194,7 @@ produce.
 
 ## Limitations
 
-- **Tested on Linux.** CI runs every test on macOS as well. Windows
+- **Tested on Linux and macOS** (CI runs every test on both). Windows
   builds have never been run; there the whole file is read into memory
   instead of being mapped.
 - **A file truncated while it is being searched** can crash fds (SIGBUS),
