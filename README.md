@@ -1,9 +1,19 @@
 # fds
 
-**Fast data search: finds a term in every string value of `.arrow`,
-`.feather` and `.arrows` files, recursively, in about 1,750 lines of Zig.**
+**Fast data search: an experimental project to bring fast string search
+to the file formats of data science and machine learning.**
 
-A command-line tool and a C library, with no dependencies. Two ideas:
+Data lives in columnar files, not text files, and finding a string in them
+usually means loading them into a dataframe or a database first. fds
+searches the files directly, grep-style: point it at a directory and a
+term, and it prints every matching value with its file, column and row.
+
+**Status: experimental (0.0.7).** The first format is Arrow IPC (`.arrow`,
+`.feather`, `.arrows`). The command line, the output and the C library may
+all change. It has been tested on one Linux machine.
+
+It is a command-line tool and a C library, about 1,800 lines of Zig with
+no dependencies. Two ideas make it fast:
 
 1. **Threads:** one task per directory, and inside a file one per piece:
    about 8 MB of one string column.

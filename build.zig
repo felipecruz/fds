@@ -1,7 +1,7 @@
 const std = @import("std");
 
 /// The release version: `fds --version` and `fds_version()` in C.
-const version = "0.1.0";
+const version = "0.0.7";
 
 // `zig build` produces:
 //   zig-out/debug/fds     (Debug: safety checks, debug info)

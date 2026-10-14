@@ -50,7 +50,7 @@ typedef int (*fds_callback)(void *ctx, const fds_match *m);
 int fds_search(const char *root, const char *term, unsigned flags,
                unsigned threads, fds_callback cb, void *ctx);
 
-/* The library version, e.g. "0.1.0". */
+/* The library version, e.g. "0.0.7". */
 const char *fds_version(void);
 
 #ifdef __cplusplus
