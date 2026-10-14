@@ -1,0 +1,10 @@
+# Build output
+.zig-cache/
+zig-out/
+
+# Benchmark files (3+ GB); bench/arrow.sh recreates them
+fixtures/
+
+# Local tool state and stray builds
+.aiflow/
+/fds
