@@ -1,5 +1,6 @@
-//! LZ4 frame decompression, for Arrow buffers compressed with LZ4_FRAME
-//! (the default of pyarrow's `write_feather`). The output size is known in
+//! LZ4 decompression: frames, for Arrow buffers compressed with LZ4_FRAME
+//! (the default of pyarrow's `write_feather`), and single blocks, for
+//! Parquet's LZ4_RAW. The output size is known in
 //! advance (Arrow stores it before each buffer), so frames decode straight
 //! into the caller's buffer; blocks may refer back into earlier blocks.
 //! Checksums are skipped, not verified.
@@ -62,6 +63,12 @@ pub fn decompress(src: []const u8, dst: []u8) Error!void {
         if (in > src.len) return error.Malformed;
     }
     if (out != dst.len) return error.Malformed;
+}
+
+/// Decompresses one LZ4 block (no frame), which must fill `dst` exactly.
+pub fn decompressBlock(src: []const u8, dst: []u8) Error!void {
+    if (src.len == 0) return if (dst.len == 0) {} else error.Malformed;
+    if (try decodeBlock(src, dst, 0) != dst.len) return error.Malformed;
 }
 
 // Decodes one LZ4 block into dst[out..] and returns the new end. Matches

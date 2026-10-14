@@ -93,6 +93,28 @@ def main():
         "st": [{"inner": "y"}, {"inner": "q"}, {"inner": "needle"}, None],
     }).write_ipc(os.path.join(HERE, "tree", "polars.arrow"))
 
+    # Parquet: the same table (without the union, which Parquet can't
+    # hold), written four ways. Strings in lists and maps (tags, m, pair)
+    # are not searched in Parquet yet; the rest matches as in the Arrow
+    # files. Plus a file with no rows.
+    import pyarrow.parquet as pq
+    pt = t.drop_columns(["u"])
+    pdir = os.path.join(HERE, "tree", "parquet")
+    os.makedirs(pdir, exist_ok=True)
+    # pyarrow's defaults: Snappy, dictionaries, v1 pages; two row groups.
+    pq.write_table(pt, os.path.join(pdir, "snappy.parquet"), row_group_size=4)
+    # v2 pages, DELTA_BYTE_ARRAY strings, zstd.
+    strings = ["name", "note", "view", "user.name"]
+    pq.write_table(pt, os.path.join(pdir, "v2_delta.parquet"), data_page_version="2.0", compression="zstd",
+                   use_dictionary=False, column_encoding={c: "DELTA_BYTE_ARRAY" for c in strings})
+    # PLAIN strings, gzip, a page for every few values.
+    pq.write_table(pt, os.path.join(pdir, "plain_gzip.parquet"), compression="gzip", use_dictionary=False,
+                   data_page_size=16, column_encoding={c: "PLAIN" for c in strings})
+    # LZ4 (written as LZ4_RAW), DELTA_LENGTH_BYTE_ARRAY strings.
+    pq.write_table(pt, os.path.join(pdir, "lz4.parquet"), compression="lz4", use_dictionary=False,
+                   column_encoding={c: "DELTA_LENGTH_BYTE_ARRAY" for c in strings})
+    pq.write_table(pt.slice(0, 0), os.path.join(pdir, "empty.parquet"))
+
     # Not Arrow files: skipped by extension, or reported as malformed.
     with open(os.path.join(HERE, "tree", "notes.txt"), "w") as f:
         f.write("needle\n")

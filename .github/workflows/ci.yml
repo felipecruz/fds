@@ -47,6 +47,8 @@ jobs:
           python testdata/check.py zig-out/release/fds testdata/tree needle
           python testdata/check.py zig-out/release/fds testdata/tree NEEDLE -i
       - name: Random tables
-        run: python testdata/fuzz.py zig-out/release/fds 300 ${{ github.run_number }}
+        run: |
+          python testdata/fuzz.py zig-out/release/fds 300 ${{ github.run_number }}
+          python testdata/fuzz.py zig-out/release/fds 300 ${{ github.run_number }} --parquet
       - name: Corrupted files (debug build)
         run: python testdata/mutate.py zig-out/debug/fds 1000 ${{ github.run_number }}

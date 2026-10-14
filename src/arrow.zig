@@ -16,7 +16,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const fb = @import("flatbuf.zig");
-const lz4 = @import("lz4.zig");
+const codecs = @import("codecs.zig");
 
 pub const Error = error{ Malformed, Unsupported, OutOfMemory };
 
@@ -365,17 +365,11 @@ pub const Batch = struct {
         const n = try fb.readInt(i64, raw, 0);
         if (n == -1) return raw[8..];
         if (n < 0 or n > 1 << 40) return error.Malformed;
-        // The length is only a claim: nothing is allocated for it up front
-        // beyond what the compressed bytes could produce.
-        switch (codec) {
-            .lz4 => {
-                if (n > lz4.maxDecompressedLen(raw.len - 8)) return error.Malformed;
-                const out = try arena.alloc(u8, @intCast(n));
-                lz4.decompress(raw[8..], out) catch return error.Malformed;
-                return out;
-            },
-            .zstd => return unzstd(arena, raw[8..], @intCast(n)),
-        }
+        // The length is only a claim; see codecs.zig.
+        return codecs.decompress(arena, switch (codec) {
+            .lz4 => .lz4_frame,
+            .zstd => .zstd,
+        }, raw[8..], @intCast(n));
     }
 
     /// The validity bitmap of `col` (its first buffer), or "" if no value
@@ -439,26 +433,6 @@ pub const Batch = struct {
         } };
     }
 };
-
-// Decompresses zstd frames that must produce exactly `n` bytes. zstd has no
-// small maximum ratio, so the output buffer starts small and grows only as
-// bytes come out; output is limited to n + 1 bytes, so a frame can't run
-// past the claimed length either.
-fn unzstd(arena: Allocator, src: []const u8, n: usize) Error![]const u8 {
-    const zstd = std.compress.zstd;
-    var in: std.Io.Reader = .fixed(src);
-    // The whole output stays in memory, so any window size fits.
-    var d: zstd.Decompress = .init(&in, &.{}, .{ .window_len = 1 << 30 });
-    var out: std.Io.Writer.Allocating = try .initCapacity(arena, @min(n, 16 * src.len + (1 << 16)) + zstd.block_size_max);
-    while (out.written().len <= n) {
-        _ = d.reader.stream(&out.writer, .limited(n + 1 - out.written().len)) catch |err| switch (err) {
-            error.EndOfStream => break,
-            else => return error.Malformed,
-        };
-    }
-    if (out.written().len != n) return error.Malformed;
-    return out.written();
-}
 
 // Offsets `from..to + 1` (the bounds of values `from..to`), checked to be
 // non-decreasing and non-negative.

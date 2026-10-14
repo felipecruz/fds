@@ -5,20 +5,24 @@ const Regex = @import("regex.zig").Regex;
 
 // Usage: fds [-j N] [-i] [-E] [-c COLUMN]... [--content] <path> <term>
 // Recursively searches every Arrow IPC file (.arrow, .feather, .arrows)
-// under <path>, or <path> itself if it is a file, and prints
-// `path:column:row` (or `path:column:row:value` with --content) for each
-// string value containing <term>. Rows are 0-based. `-i` ignores ASCII
-// case. `-E` treats <term> as a regex (see regex.zig). `-c` limits the
-// search to some columns. Files come out in no fixed order; within a file,
-// by record batch, then column, then row.
+// and Parquet file (.parquet) under <path>, or <path> itself if it is a
+// file, and prints `path:column:row` (or `path:column:row:value` with
+// --content) for each string value containing <term>. Rows are 0-based.
+// `-i` ignores ASCII case. `-E` treats <term> as a regex (see regex.zig).
+// `-c` limits the search to some columns. Files come out in no fixed
+// order; within a file, by record batch (or row group), column, then row.
 //
 // Layers:
 //   main.zig    command line
 //   c_api.zig   the same search as a C library (include/fds.h)
 //   walk.zig    parallel recursive directory walk (one task per directory)
-//   search.zig  thread pool, per-file work: find string arrays, cut into pieces, output
+//   search.zig  thread pool, pieces, matching, output; per format:
+//     search_arrow.zig    Arrow IPC files and streams into pieces
+//     search_parquet.zig  Parquet files into pieces (one per column chunk)
 //   map.zig     the file's bytes: map, release parts early (linux.zig), close
-//   arrow.zig   Arrow IPC messages, schema and buffers (flatbuf.zig, lz4.zig)
+//   arrow.zig   Arrow IPC messages, schema and buffers (flatbuf.zig)
+//   parquet.zig Parquet footer, schema, pages and encodings (thrift.zig)
+//   codecs.zig  decompression: LZ4 (lz4.zig), Snappy (snappy.zig), zstd, gzip
 //   match.zig   finding the term in a string array (SIMD), no I/O
 //   regex.zig   regex: parser, Pike VM, SIMD literal prefilter
 //
@@ -97,8 +101,9 @@ pub fn main(init: std.process.Init) !void {
 fn usage() noreturn {
     std.debug.print(
         \\usage: fds [-j N|auto] [-i] [-E] [-c COLUMN]... [--content] <path> <term>
-        \\  Searches the string values of every .arrow, .feather and .arrows file
-        \\  under <path> (or the file <path>), printing <path>:<column>:<row>.
+        \\  Searches the string values of every .arrow, .feather, .arrows and
+        \\  .parquet file under <path> (or the file <path>), printing
+        \\  <path>:<column>:<row>.
         \\  -j N|auto          worker threads (default: auto = {d} here, the
         \\                     performance-core count on Apple silicon, else all CPUs)
         \\  -i, --ignore-case  match ASCII letters regardless of case
@@ -119,6 +124,10 @@ test {
     _ = @import("flatbuf.zig");
     _ = @import("lz4.zig");
     _ = @import("map.zig");
+    _ = @import("codecs.zig");
+    _ = @import("parquet.zig");
+    _ = @import("snappy.zig");
+    _ = @import("thrift.zig");
     _ = @import("match.zig");
     _ = @import("regex.zig");
     _ = @import("search.zig");

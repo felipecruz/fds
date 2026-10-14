@@ -33,6 +33,7 @@ pub const Map = struct {
     /// Says that `part` (a slice of `bytes`) won't be read again. Reading
     /// it anyway stays correct; it may only be slower.
     pub fn release(m: Map, part: []const u8) void {
+        if (part.len == 0) return; // nothing to release (and maybe not in the map)
         std.debug.assert(@intFromPtr(part.ptr) >= @intFromPtr(m.bytes.ptr) and
             @intFromPtr(part.ptr) + part.len <= @intFromPtr(m.bytes.ptr) + m.bytes.len);
         if (builtin.os.tag == .linux) linux.dropPages(part);

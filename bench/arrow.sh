@@ -1,7 +1,7 @@
 #!/bin/sh
 # Benchmark fds on the log files from bench/make_logs.py, with hyperfine.
 # Usage: bench/arrow.sh [dir]   (default: fixtures/logs; built if missing)
-# Then compare with: python3 bench/others.py <dir>/logs.arrow
+# Then compare with: python3 bench/others.py <dir>
 set -eu
 cd "$(dirname "$0")/.."
 DIR="${1:-fixtures/logs}"

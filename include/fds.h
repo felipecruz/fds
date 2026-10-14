@@ -1,5 +1,5 @@
-/* fds: search the string values of Arrow IPC files (threads + SIMD), as a
- * C library.
+/* fds: search the string values of Arrow IPC and Parquet files (threads +
+ * SIMD), as a C library.
  *
  * Build: `zig build` installs zig-out/lib/libfds.a and zig-out/include/fds.h.
  * Example: examples/count.c (`zig build c-example -- <folder> <term>`).
@@ -41,10 +41,12 @@ typedef struct fds_match {
  * call. Return 0 to continue, nonzero to stop. */
 typedef int (*fds_callback)(void *ctx, const fds_match *m);
 
-/* Searches every string value (utf8, large_utf8, string_view; dictionary-
- * encoded or not; top-level or inside structs, lists and maps) of every
- * .arrow, .feather and .arrows file under `root`, or of `root` itself if it
- * is a file, for `term`. Files that are not valid Arrow are skipped.
+/* Searches every string value of every .arrow, .feather, .arrows and
+ * .parquet file under `root`, or of `root` itself if it is a file, for
+ * `term`. In Arrow files: utf8, large_utf8 and string_view, dictionary-
+ * encoded or not, top-level or inside structs, lists and maps. In Parquet
+ * files: string columns, top-level or inside structs (not lists yet).
+ * Files that can't be read are skipped.
  * `threads` = 0 means automatic: the performance-core count on Apple
  * silicon, else the CPU count. Blocks until done. */
 int fds_search(const char *root, const char *term, unsigned flags,

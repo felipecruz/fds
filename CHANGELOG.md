@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **Parquet support.** `.parquet` files are searched too: string columns
+  (STRING, ENUM, JSON), at the top level or in structs. Snappy, gzip, zstd,
+  LZ4 (raw and Hadoop); data pages v1 and v2; PLAIN, dictionary,
+  DELTA_LENGTH_BYTE_ARRAY and DELTA_BYTE_ARRAY strings. Dictionary pages
+  are skipped undecompressed when no entry matches, and plain pages are
+  skipped undecoded when their bytes don't contain the term. Strings in
+  lists and maps are not searched yet.
+- Built-in Snappy decoder and a bounds-checked Thrift reader; all
+  decompression goes through `codecs.zig`, with the same allocation limits
+  for every codec.
+- `search.zig` is split: the generic layer, plus `search_arrow.zig` and
+  `search_parquet.zig`.
 - Fixed: files written by polars (`write_ipc`) were rejected as malformed.
   IPC files are now read through their footer, as other readers do.
 - Fixed: a corrupted compressed buffer could make fds allocate as much

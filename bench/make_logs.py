@@ -1,7 +1,9 @@
 """Writes the benchmark files: 20M rows of log-like data, 2.3 GB of strings.
 
 Usage: python3 bench/make_logs.py <out dir>   (needs pyarrow and numpy)
-Writes logs.arrow (uncompressed, 20 record batches) and logs_lz4.feather.
+Writes logs.arrow (uncompressed, 20 record batches), logs_lz4.feather, and
+the same table as Parquet: logs.parquet (pyarrow's defaults: Snappy,
+dictionaries), logs_zstd.parquet and logs_plain.parquet (no dictionaries).
 Columns: ts (int64), host, path, level (dictionary), message (8 words).
 """
 
@@ -12,6 +14,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.feather as feather
 import pyarrow.ipc as ipc
+import pyarrow.parquet as pq
 
 out = sys.argv[1]
 rng = np.random.default_rng(42)
@@ -34,3 +37,6 @@ table = pa.Table.from_batches(batches)
 with ipc.new_file(os.path.join(out, "logs.arrow"), table.schema) as w:
     w.write_table(table)
 feather.write_feather(table, os.path.join(out, "logs_lz4.feather"), chunksize=1_000_000)
+pq.write_table(table, os.path.join(out, "logs.parquet"))
+pq.write_table(table, os.path.join(out, "logs_zstd.parquet"), compression="zstd")
+pq.write_table(table, os.path.join(out, "logs_plain.parquet"), use_dictionary=False)

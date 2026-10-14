@@ -1,9 +1,9 @@
-"""Compares fds with a Python search on existing Arrow files.
+"""Compares fds with a Python search on existing Arrow and Parquet files.
 
 Usage: python3 testdata/check.py <fds binary> <path> <term> [-i]   (needs pyarrow)
 
-Reads every .arrow, .feather and .arrows file under <path> (or <path>
-itself) with pyarrow, finds the values containing <term> with the same
+Reads every .arrow, .feather, .arrows and .parquet file under <path> (or
+<path> itself) with pyarrow, finds the values containing <term> with the same
 reference search as fuzz.py, and checks that `fds` prints exactly those
 matches. Files pyarrow can't read must be reported by fds, not searched.
 """
@@ -14,11 +14,12 @@ import sys
 
 import pyarrow as pa
 import pyarrow.ipc as ipc
+import pyarrow.parquet as pq
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fuzz import ascii_lower, hits  # noqa: E402
 
-EXTENSIONS = (".arrow", ".feather", ".arrows")
+EXTENSIONS = (".arrow", ".feather", ".arrows", ".parquet")
 
 
 def arrow_files(root):
@@ -34,7 +35,10 @@ def arrow_files(root):
 def read(path):
     """The table in an IPC file or stream; the format comes from the magic."""
     source = pa.memory_map(path)
-    if source.read(6) == b"ARROW1":
+    head = source.read(6)
+    if head.startswith(b"PAR1"):
+        return pq.read_table(path)
+    if head == b"ARROW1":
         return ipc.open_file(path).read_all()
     return ipc.open_stream(path).read_all()
 
@@ -49,11 +53,12 @@ def expected_matches(root, term, fold):
             continue
         rows_total += table.num_rows
         needle = ascii_lower(term) if fold else term
+        lists = not path.endswith(".parquet")  # fds doesn't search lists in Parquet yet
         # Paths as fds prints them: "<root>/<relative path>", or the root.
         shown = path if os.path.isfile(root) else root.rstrip("/") + "/" + os.path.relpath(path, root)
         for row_index, row in enumerate(table.to_pylist()):
             for f in table.schema:
-                for col in hits(f.name, f.type, row[f.name], needle, fold):
+                for col in hits(f.name, f.type, row[f.name], needle, fold, lists):
                     expected.add(f"{shown}:{col}:{row_index}")
     return expected, bad, rows_total
 

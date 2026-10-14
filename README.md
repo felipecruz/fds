@@ -8,11 +8,11 @@ usually means loading them into a dataframe or a database first. fds
 searches the files directly, grep-style: point it at a directory and a
 term, and it prints every matching value with its file, column and row.
 
-**Status: experimental (0.0.7).** The first format is Arrow IPC (`.arrow`,
-`.feather`, `.arrows`). The command line, the output and the C library may
-all change. It has been tested on one Linux machine.
+**Status: experimental.** Formats: Arrow IPC (`.arrow`, `.feather`,
+`.arrows`) and Parquet (`.parquet`). The command line, the output and the C
+library may all change.
 
-It is a command-line tool and a C library, about 1,800 lines of Zig with
+It is a command-line tool and a C library, about 2,800 lines of Zig with
 no dependencies. Two ideas make it fast:
 
 1. **Threads:** one task per directory, and inside a file one per piece:
@@ -24,6 +24,11 @@ An Arrow string column is all of its values back to back in one buffer,
 plus an offsets array. That is exactly the input the SIMD loop wants. The
 file is memory-mapped and the column searched in place: no parsing into
 rows, no copies (unless the file is compressed).
+
+Parquet stores strings encoded and compressed, so pages must be decoded
+first, but most pages never are: a dictionary-encoded page is skipped,
+undecompressed, when no dictionary entry matched, and a plain page is
+skipped, undecoded, when its raw bytes don't contain the term.
 
 ## Results
 
@@ -61,9 +66,27 @@ timing only the query):
 
 Cold, fds reads at about 4.6 GB/s, the speed of the drive.
 
+### Parquet
+
+The same 20 million rows as Parquet, warm page cache, same machine, 16
+threads each. DuckDB and polars read Parquet natively.
+
+| No-match search | **fds** | DuckDB 1.5 | polars 2.0 |
+|:---|---:|---:|---:|
+| pyarrow defaults: Snappy, dictionaries (707 MB) | **275 ms** | 324 ms | 470 ms |
+| No dictionaries, plain pages (792 MB) | **335 ms** | 459 ms | 583 ms |
+| zstd (535 MB) | 1,907 ms | **406 ms** | 593 ms |
+
+- With Snappy, fds is level with DuckDB on rare terms (302 ms against
+  346 ms) and common ones (459 ms against 480 ms).
+- **zstd is slow**: Zig's standard-library decoder runs at about 175 MB/s
+  per core, against about 1,550 MB/s for the reference C library.
+
+The script is `bench/parquet.sh`; `bench/others.py` times DuckDB and polars.
+
 ## What gets searched
 
-Every string value the schema has:
+Every string value the schema has. In **Arrow** files:
 
 - `utf8` (`string`), `large_utf8` (`large_string`) and `utf8_view` (`string_view`);
 - dictionary-encoded strings (pandas categoricals): each distinct value
@@ -73,6 +96,10 @@ Every string value the schema has:
 
 Not searched: binary columns, and strings inside unions, run-end-encoded
 or list-view arrays.
+
+In **Parquet** files: `BYTE_ARRAY` columns annotated as text (`STRING`,
+`ENUM` or `JSON`), at the top level or inside structs (`user.name`).
+Not yet: strings inside lists and maps.
 
 ## Usage
 
@@ -88,9 +115,10 @@ fds [-j N|auto] [-i] [-E] [-c COLUMN]... [--content] <path> <term>
   --content          print path:column:row:value instead of path:column:row
 ```
 
-`<path>` is a directory (every `.arrow`, `.feather` and `.arrows` file under
-it is searched) or a single file (searched whatever its name). Output is
-one line per matching value:
+`<path>` is a directory (every `.arrow`, `.feather`, `.arrows` and
+`.parquet` file under it is searched) or a single file (searched whatever
+its name; the format comes from its first bytes). Output is one line per
+matching value:
 
 ```
 $ fds data needle --content
@@ -101,7 +129,7 @@ data/events.arrow:m[].value:0:needle
 ```
 
 - **Rows are 0-based** and count from the start of the file, across record
-  batches, so `df.iloc[row]` finds them.
+  batches or row groups, so `df.iloc[row]` finds them.
 - **Column paths:** a struct field is `user.name`, a list element is
   `tags[]`, and map keys and values are `m[].key` and `m[].value`. A row
   whose list holds several matches is reported once.
@@ -128,6 +156,8 @@ fds_search("data", "needle", FDS_IGNORE_CASE, 0, on_match, NULL);
 
 ## Formats
 
+**Arrow:**
+
 - The IPC file format (`.arrow`, `.feather`, which is Feather v2) and the
   IPC stream format (`.arrows`), including old streams without the
   continuation marker.
@@ -143,9 +173,24 @@ Checked against files written by pyarrow (`ipc`, `feather`, pandas
 and compat levels), Arrow JS, and the Hugging Face `datasets` cache
 (Arrow streams named `.arrow`), with `testdata/check.py`.
 
-A malformed file is reported (`fds: <path>: not a valid Arrow IPC file`) and
-skipped; matches found before the problem are still printed. Every offset
-read from a file is bounds-checked first.
+**Parquet:**
+
+- Codecs: uncompressed, Snappy, gzip, zstd, LZ4 (`LZ4_RAW` and the older
+  Hadoop-framed `LZ4`). Snappy and LZ4 decoders are built in; zstd and
+  gzip come from Zig's standard library. Not supported: LZO and Brotli.
+- Data pages v1 and v2; string encodings `PLAIN`, `RLE_DICTIONARY` /
+  `PLAIN_DICTIONARY`, `DELTA_LENGTH_BYTE_ARRAY` and `DELTA_BYTE_ARRAY`.
+- Not supported: encrypted files, and columns stored in other files.
+
+Checked against files written by pyarrow and pandas, polars, DuckDB
+(including its v2 mode), fastparquet, and Parquet files from the Hugging
+Face Hub (`squad`, `ag_news`, `imdb`).
+
+A malformed file is reported (`fds: <path>: not a valid Parquet file`, or
+`Arrow IPC`) and skipped; matches found before the problem are still
+printed. Every offset, length and count read from a file is checked first,
+and no size a file claims can make fds allocate more than the data could
+produce.
 
 ## Limitations
 
@@ -157,6 +202,12 @@ read from a file is bounds-checked first.
 - **ASCII semantics.** `-i`, `\w` and `\b` are ASCII-only.
 - **String views** are searched one value at a time, because their bytes
   are not stored back to back. That is slower than `utf8` columns.
+- **Parquet:** strings inside lists and maps are not searched yet. zstd
+  files are slow (see Results). A column chunk is searched by one thread,
+  so a file with fewer chunks than threads doesn't use them all.
+- **Parquet pages are capped at 16 M values**, far above what writers
+  produce, so that a corrupted header can't make fds allocate without
+  bound. A larger page is reported as unsupported.
 
 ## Correctness
 
@@ -164,10 +215,14 @@ read from a file is bounds-checked first.
 - the SIMD search against a naive per-value search (randomized, including
   matches that span two values, which must not count);
 - the regex VM against a backtracking reference matcher;
-- the LZ4 decoder on pyarrow output, with every truncation;
-- searches of `testdata/tree`: the same table stored plain, LZ4 and zstd,
-  a stream with dictionary deltas, and a file written by polars
-  (`testdata/make.py` writes them), whole and cut into tiny pieces;
+- every codec (LZ4, Snappy, gzip, zstd) on real compressor output, with
+  every truncation and lies about the size;
+- the Thrift reader, the run-length and delta decoders;
+- searches of `testdata/tree`: the same table stored as Arrow (plain, LZ4,
+  zstd) and Parquet (Snappy with dictionaries, v2 pages with
+  `DELTA_BYTE_ARRAY` and zstd, plain gzip with tiny pages, LZ4), a stream
+  with dictionary deltas, a file written by polars and an empty Parquet
+  file (`testdata/make.py` writes them), whole and cut into tiny pieces;
 - the C API, called the way C would call it.
 
 Three scripts compare fds with pyarrow (they need `pyarrow`, and
@@ -177,9 +232,11 @@ Three scripts compare fds with pyarrow (they need `pyarrow`, and
   path with pyarrow, searches it in Python, and checks that fds prints
   exactly the same matches and reports exactly the files pyarrow can't
   read. Use it on your own data.
-- `testdata/fuzz.py <fds>` writes random tables (random string types,
-  nesting, nulls, dictionaries, slices, batch sizes, compression, file or
-  stream) and does the same check.
+- `testdata/fuzz.py <fds> [n] [seed] [--parquet]` writes random tables
+  (random string types, nesting, nulls, dictionaries, slices, batch sizes,
+  compression, file or stream; with `--parquet`, random codecs, page
+  versions, string encodings, page and row group sizes) and does the same
+  check.
 - `testdata/mutate.py <debug fds>` corrupts the test files at random. fds
   must not crash (the debug build panics on any out-of-bounds access),
   hang or use more than 1 GB on any of them.

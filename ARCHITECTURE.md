@@ -1,7 +1,7 @@
 # fds architecture
 
-How fds is put together: from a directory walk, through the Arrow IPC
-reader, to the SIMD loop that finds a term in a string column.
+How fds is put together: from a directory walk, through the Arrow IPC and
+Parquet readers, to the SIMD loop that finds a term in a string column.
 
 ## Code layout
 
@@ -9,12 +9,18 @@ reader, to the SIMD loop that finds a term in a string column.
 |---|---|
 | `src/main.zig` | Command line; calls `search.run` |
 | `src/walk.zig` | Parallel recursive directory walk; knows nothing about searching |
-| `src/search.zig` | `run`: thread pool and walk. Per file: read messages, find string arrays, cut batches into pieces, search them in parallel, output |
+| `src/search.zig` | `run`: thread pool and walk. Per file: detect the format, run its pieces in parallel, report. Also the `Matcher` and the output |
+| `src/search_arrow.zig` | An Arrow file or stream into pieces: read messages, find string arrays, search dictionaries, cut batches |
+| `src/search_parquet.zig` | A Parquet file into pieces: one per string column chunk |
 | `src/map.zig` | The file's bytes: map, close, and `release` parts that won't be read again |
 | `src/linux.zig` | Linux-only code (used by `map.zig`): dropping a part's pages early |
 | `src/arrow.zig` | Arrow IPC: messages, schema, record batch layout, buffers, string arrays, dictionary indices, nesting |
 | `src/flatbuf.zig` | A bounds-checked FlatBuffers reader for Arrow's metadata |
-| `src/lz4.zig` | LZ4 frame decompression (zstd comes from `std.compress.zstd`) |
+| `src/parquet.zig` | Parquet: footer, schema, column chunks, pages, levels and string encodings; searching a chunk |
+| `src/thrift.zig` | A bounds-checked Thrift compact-protocol reader for Parquet's metadata |
+| `src/codecs.zig` | Every codec behind one call, with allocation limits |
+| `src/lz4.zig` | LZ4 frames and blocks |
+| `src/snappy.zig` | Snappy blocks |
 | `src/match.zig` | Finding the term in a string array (SIMD), with no I/O; naive reference and randomized test |
 | `src/regex.zig` | `-E`: regex parser, compiler and Pike VM, behind the SIMD search as a prefilter |
 | `src/c_api.zig` | C ABI (`include/fds.h`): `fds_search` with a callback, over `search.run` |
@@ -25,9 +31,16 @@ The layers connect through small interfaces resolved at compile time
 
 - **walk → search.** A *visitor* has a per-directory-task `Local` state and
   a `visitFile(local, file)` function. The walker hands over every regular
-  file; `search.zig` keeps the ones named `*.arrow`, `*.feather` or
-  `*.arrows` (in any case). A root that is a file skips the walk and is
-  searched whatever its name.
+  file; `search.zig` keeps the ones named `*.arrow`, `*.feather`,
+  `*.arrows` or `*.parquet` (in any case). A root that is a file skips the
+  walk and is searched whatever its name. Either way the format comes
+  from the file's first bytes (`PAR1` is Parquet), not its name.
+- **search → format.** A format module has `plan(file, arena, matcher)`,
+  which adds the file's pieces in output order, and a `Job` type (one
+  variant of `search.Job`) with `search(...)` and `finish(...)` for one
+  piece. A piece's matches go to `Piece.record(row, value)`, which writes
+  the output line (or keeps the value for the C callback) and reports a
+  row only once.
 - **search → match.** `match.findValues(case, O, off, data, term, sink)`
   calls `sink.onValue(row, value)` for each value of a string array that
   contains `term`. `O` is `i32` (`utf8`) or `i64` (`large_utf8`).
@@ -35,15 +48,18 @@ The layers connect through small interfaces resolved at compile time
   that are not stored back to back, `match.contains` and `regex.matches`
   test one value.
 
-## One file, start to finish
+## One Arrow file, start to finish
+
+(Parquet: see *Parquet* below; the steps around it, mapping, running
+pieces, releasing and reporting, are the same.)
 
 ```
-walk.zig     one task per directory ──► visitFile ──► *.arrow, *.feather, *.arrows only
+walk.zig     one task per directory ──► visitFile ──► data files only
 map.zig      mmap the file
-search.zig   read messages in order ─► schema: find string arrays
-                                    ─► dictionary batch: search its values now
-                                    ─► record batch: cut into pieces
-             pieces in parallel (Io.Group) ─► match.findValues ─► map to row
+search_arrow.zig  read messages in order ─► schema: find string arrays
+                                         ─► dictionary batch: search its values now
+                                         ─► record batch: cut into pieces
+search.zig   pieces in parallel (Io.Group) ─► match.findValues ─► map to row
                                            ─► batch's last piece done: release its pages
              report pieces in order, under the output mutex
 map.zig      munmap (nothing left to tear down on Linux)
@@ -161,13 +177,8 @@ batches.
 **Buffers.** `Batch.buffer(i)` returns a slice of the body. With body
 compression, every non-empty buffer starts with its uncompressed length
 as an `i64` (-1 means it was stored uncompressed). The rest is one LZ4
-frame or zstd frame, decoded into memory that belongs to the job.
-The declared length is only a claim, so nothing is allocated for it
-beyond what the compressed bytes could produce. LZ4 can't expand more than
-255×, so a larger claim is rejected before allocating anything. zstd has no
-such small bound, so its output buffer starts small and grows only as
-bytes come out, up to the claim plus one byte. Before this, a corrupted
-7.6 KB file could make fds allocate 48 GB (`testdata/mutate.py` found it).
+frame or zstd frame, decoded into memory that belongs to the job. The
+declared length is only a claim; see *Decompression* below.
 
 **Checks before searching.** `utf8` and `large_utf8` offsets are checked
 once per array: there must be n + 1 of them, non-negative and
@@ -178,7 +189,7 @@ list offsets are checked the same way. After that the search can index
 without checks. That matters in ReleaseFast, where unchecked out-of-range
 indexing is undefined behaviour, not a panic.
 
-## Targets: every string in the schema (`search.zig`)
+## Targets: every string in the schema (`search_arrow.zig`)
 
 A *target* is one string array: a field whose type is `utf8`, `large_utf8`
 or `utf8_view`, or a dictionary-encoded field whose values have one of those
@@ -218,6 +229,85 @@ matching keys. Each row's index is looked up in that bitset, and if no key
 matched, the column is skipped entirely. A low-cardinality column (a
 `level` with four values in 20 million rows) costs one pass over its
 indices.
+
+## Parquet (`src/parquet.zig`, `src/thrift.zig`, `src/search_parquet.zig`)
+
+A Parquet file is `PAR1`, column chunks, a footer (FileMetaData, in
+Thrift's compact protocol), its length and `PAR1` again. `parquet.open`
+reads the footer: the schema, and for each row group where each column's
+chunk is, its codec and its value count.
+
+**Schema → columns.** The schema is a flattened tree: a pre-order list of
+elements, where a group says how many children follow. Walking it gives
+the leaves in chunk order, each with its path, its maximum definition
+level (one per optional or repeated field on the way) and its maximum
+repetition level (one per repeated field). A leaf is searched if it is a
+`BYTE_ARRAY` annotated as text (logical type STRING, ENUM or JSON, or the
+converted types UTF8, ENUM, JSON) and nothing above it is repeated. Then
+every value is one row: top-level columns and struct fields (`user.name`).
+Leaves under lists or maps have repetition levels, and values no longer
+map one-to-one to rows; they are not searched yet.
+
+**Pieces.** One per searched column per row group, in output order (row
+group, then column). Each chunk is its own byte range of the file, so a
+finished piece releases it right away.
+
+**A chunk** is pages, each a Thrift `PageHeader` then its bytes:
+1. An optional **dictionary page**: decompressed, its values decoded
+   (PLAIN: a 4-byte length, then the bytes) into offsets and data, and
+   searched once, giving a bitset of matching keys.
+2. **Data pages**, v1 or v2. In v1 the whole page is compressed, and holds
+   the definition levels (a 4-byte length, then the run-length/bit-packing
+   hybrid) then the values. In v2 the levels come first, uncompressed, with
+   their lengths in the header, and only the values are compressed.
+
+**Skipping pages.** Two checks run before any real work:
+- A **dictionary-encoded** page whose dictionary had no matching entry
+  can't match. It is skipped before it is even decompressed. This is the
+  common case for a rare term in a low-cardinality column.
+- A **PLAIN** page is decompressed, but before its values are decoded,
+  `Matcher.mayMatch` scans its raw bytes for the term (or a regex's required
+  literal) with the SIMD loop. If the term is nowhere, no value can hold it.
+
+**Decoding.** Definition levels say which rows hold a value (level = the
+maximum) and which are null. Values come in:
+- `PLAIN`: copied out of their length prefixes into back-to-back data, so
+  `match.findValues` runs on them as on an Arrow column;
+- `RLE_DICTIONARY` / `PLAIN_DICTIONARY`: a bit width, then keys in the
+  hybrid encoding, each looked up in the dictionary's bitset;
+- `DELTA_LENGTH_BYTE_ARRAY`: lengths (`DELTA_BINARY_PACKED`), then the
+  bytes back to back, so they are searched in place;
+- `DELTA_BYTE_ARRAY`: each value a prefix of the previous one plus a
+  suffix; rebuilt, then searched.
+A match's index among the page's values maps back to its row through the
+list of present rows, plus the page's first row in the chunk and the row
+group's first row in the file.
+
+**Limits.** Run-length encoding makes huge counts cheap to write, so
+counts are never trusted alone. A page may hold at most 16 M values
+(`max_page_values`; real pages hold thousands). A delta header's count
+must equal the number of present values. Rebuilt `DELTA_BYTE_ARRAY`
+values are capped at 256 MB per page. Everything else is checked against
+the bytes actually there.
+
+## Decompression (`src/codecs.zig`)
+
+Every codec, for both formats, goes through `codecs.decompress(codec, src,
+n)`, where `n` is the size the file states. A corrupted file can state any
+size, so `n` is a claim, and nothing is allocated for it beyond what `src`
+could produce:
+- **LZ4** expands at most 255× and **Snappy** about 22×, so a larger claim
+  is rejected before allocating anything.
+- **zstd** and **gzip** have no small bound. Their output buffer starts
+  small, grows only as bytes come out, and stops one byte past the claim.
+
+Before this rule, a 7.6 KB corrupted Arrow file could make fds allocate
+48 GB (`testdata/mutate.py` found it).
+
+The Snappy and LZ4 decoders are built in (`snappy.zig`, `lz4.zig`). zstd
+and gzip are Zig's standard library. Its zstd decoder is correct but slow,
+about 175 MB/s per core against about 1,550 MB/s for the reference C
+library, which is why zstd Parquet files are slow.
 
 ## The SIMD loop (`src/match.zig`)
 
@@ -357,17 +447,28 @@ creates threads with its own TLS setup, which a C `main` never runs, and
 
 - `testdata/make.py` writes the fixtures in `testdata/tree`: one table
   with every kind of string array, between non-string columns (binary, a
-  dense union with strings in it, floats), stored three ways (plain, LZ4
-  Feather, zstd). There is also a stream with a dictionary delta and a
-  replacement, a text file and a truncated file. `search.zig` tests the
-  exact matches.
-- `testdata/fuzz.py <fds> [iterations] [seed]` is a differential test
-  against a Python search over `to_pylist()`. It uses random tables with
-  random nesting up to two levels, nulls at every level, dictionaries
-  with five index types, slices, 1–10 row batches, three compressions,
-  and file or stream format.
-- Corrupted files: random byte edits of the fixtures, run through the
-  debug build, where an out-of-bounds index panics. 4,000 runs, no panics.
+  dense union with strings in it, floats), stored as Arrow three ways
+  (plain, LZ4 Feather, zstd) and as Parquet four ways (Snappy with
+  dictionaries in two row groups; v2 pages, `DELTA_BYTE_ARRAY` and zstd;
+  plain gzip with tiny pages; LZ4 with `DELTA_LENGTH_BYTE_ARRAY`). There
+  is also a stream with a dictionary delta and a replacement, a polars
+  file, an empty Parquet file, a text file and a truncated file.
+  `search.zig` tests the exact matches.
+- `testdata/fuzz.py <fds> [iterations] [seed] [--parquet]` is a
+  differential test against a Python search over `to_pylist()`. It uses
+  random tables with random nesting up to two levels, nulls at every
+  level, dictionaries with five index types, slices, 1–10 row batches,
+  three compressions, and file or stream format. With `--parquet`: five
+  codecs, dictionaries on or off, page v1 or v2, `PLAIN` or delta string
+  encodings, pages from 64 bytes and row groups of 1–50 rows.
+- `testdata/check.py <fds> <path> <term>` runs the same comparison on
+  existing files: those from other writers (pandas, polars, Arrow JS,
+  DuckDB, fastparquet) and real datasets (Hugging Face).
+- `testdata/mutate.py <debug fds> [runs] [seed] [files...]` makes random
+  byte edits to files and searches them with the debug build, where an
+  out-of-bounds index panics. fds must exit cleanly within 10 s and 1 GB.
+  Runs so far: 4,500 corrupted Arrow files and 5,500 corrupted Parquet
+  files (pyarrow, DuckDB, polars, fastparquet), with no failures.
 
 ## Cost per byte
 
