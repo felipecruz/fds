@@ -346,6 +346,7 @@ Three scripts compare fds with pyarrow (they need `pyarrow`, and
   hang or use more than 1 GB on any of them.
 
 CI (`.github/workflows/ci.yml`) runs all of it on Linux and macOS.
+[SECURITY.md](SECURITY.md) says what that guarantees for untrusted files.
 
 ## More
 
@@ -354,4 +355,6 @@ CI (`.github/workflows/ci.yml`) runs all of it on Linux and macOS.
   documentation, topic by topic.
 - [ARCHITECTURE.md](ARCHITECTURE.md): how the code works, from the Arrow
   reader to the SIMD loop.
+- [SECURITY.md](SECURITY.md): what an untrusted file can't make fds do,
+  the known limits, and how to report a vulnerability.
 - [CHANGELOG.md](CHANGELOG.md).
