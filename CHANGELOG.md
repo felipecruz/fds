@@ -2,11 +2,19 @@
 
 ## Unreleased
 
+- **Where in the row:** a match in a list or map says where it is:
+  `tags[1]` (list element 1), `m[key]` (the value of entry `key`),
+  `m[key].key`, `a[0].b[2]`, in place of `tags[]` or `m[].value`. Every
+  matching element is now a line (a row's list used to be reported
+  once). `--json` adds `"at"` next to `"column"`, which stays the column
+  path, as do `-c` and `--count` (still counting rows). In the C API,
+  `fds_match.at`.
 - **Documentation in `docs/`**, one page per topic. Every example shows
   its real output, and CI fails if one changes (`docs/examples.py
   --check`). The same pages are built into the binary (`fds help
   <topic>`), and a man page is generated from `docs/fds.1.md` and
-  installed by `zig build` (`man fds`).
+  installed by `zig build` (`man fds`). Published at
+  https://felipecruz.github.io/fds/ (`.github/workflows/pages.yml`).
 - Writing into a closed pipe (`fds ... | head`) stops the search quietly,
   as grep does, instead of printing `WriteFailed`.
 - **Parquet: strings in lists and maps are searched**, at any depth

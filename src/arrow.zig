@@ -567,4 +567,14 @@ pub const Level = struct {
         if (p >= l.len or !validBit(l.validity, p)) return null;
         return p;
     }
+
+    /// Where child `j` sits in entry `p` (as `parent` found it): its index
+    /// in the list or map. 0 for a struct.
+    pub fn position(l: Level, p: usize, j: usize) usize {
+        return switch (l.children) {
+            .same => 0,
+            .fixed => |size| j - p * size,
+            inline .small, .large => |off| j - @as(usize, @intCast(off[p])),
+        };
+    }
 };

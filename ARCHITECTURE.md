@@ -268,7 +268,9 @@ values, and the levels say which: an entry (a value or a null) whose
 repetition level is 0 starts a row, any other continues the last one,
 which may have started on an earlier page (`rowsOf`). Present values (the
 maximum definition level) are mapped to their row, and the sink gets them
-in row order; `Piece.record` reports a row once.
+in row order, with its `Position`: per level, its index in its list and
+its entry's number in the chunk, which finds a map's key in the key
+column's chunk (`parquet.chunkValues`, read at the first match).
 
 **Pieces.** One per searched column per row group, in output order (row
 group, then column). Each chunk is its own byte range of the file, so a
@@ -511,8 +513,12 @@ mutex. The output modes are decided in those two places:
 - **`-m N`**: a piece stops after N matches of its own (no piece can
   contribute more), and `report` keeps the first N of the file, in order.
 
-`record` reports a row once even if several list elements in it match:
-rows arrive in order, so it remembers the last.
+`record` gets each matching value with its place in the row (`Hit.at`:
+`tags[1]`, `m[key]`), which the format fills in: Arrow from the list
+offsets and the map's key array (`search_arrow.Sink.place`), Parquet from
+the repetition levels and the key column (`search_parquet.Sink.place`).
+Each value is a line; with `--count`, a row counts once (rows arrive in
+order, so it remembers the last).
 
 `run` returns a `Summary` (did anything match; did any file fail), which
 `main` turns into the exit status: 0, 1 or 2, as grep.

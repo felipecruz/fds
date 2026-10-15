@@ -22,9 +22,12 @@ fds - search the string values of Arrow and Parquet files
 *path* itself if it is a file (whatever its name), and prints
 *path*:*column*:*row* for each value that contains *term*.
 
-Rows are 0-based and count from the start of the file. Columns are paths:
-*user.name* for a struct field, *tags[]* for the values of a list,
-*m[].key* and *m[].value* for a map's. Files come out in no fixed order;
+Rows are 0-based and count from the start of the file. The column is the
+value's place in its row: *user.name* for a struct field, *tags[1]* for
+element 1 of a list, *m[key]* for the value of a map's entry *key* and
+*m[key].key* for its key. Each matching value is a line. Options that
+take a column (**-c**) and **\--count** use column paths, with positions
+left out: *tags[]*, *m[].value*, *m[].key*. Files come out in no fixed order;
 within a file, matches are ordered by row group (or record batch), column,
 then row.
 
@@ -79,7 +82,8 @@ views) and files it can't read are reported on standard error.
 :   Stop after *n* matches in each file.
 
 **\--json**
-:   JSON Lines: **{"path","column","row","value"}**, or **{"path"}** with
+:   JSON Lines: **{"path","column","at","row","value"}**, *column* being
+    the column path and *at* the place, or **{"path"}** with
     **-l** and **{"path","column","count"}** with **\--count**. Bytes that
     aren't UTF-8 are given base64-encoded, as **value_base64**.
 

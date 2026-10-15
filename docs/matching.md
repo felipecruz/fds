@@ -46,8 +46,8 @@ value, not of a line:
 ```console
 $ fds -E --content -c name -c tags parquet/snappy.parquet '^needle$'
 parquet/snappy.parquet:name:0:needle
-parquet/snappy.parquet:tags[]:0:needle
-parquet/snappy.parquet:tags[]:3:needle
+parquet/snappy.parquet:tags[1]:0:needle
+parquet/snappy.parquet:tags[0]:3:needle
 $ fds -E --content -c name plain.arrow 'a \w+ here'
 plain.arrow:name:4:a needle here
 ```
@@ -68,7 +68,8 @@ instead: 1.2 to 4 times faster on the benchmarks, and the full PCRE
 syntax: lazy quantifiers, lookaround, backreferences, POSIX classes.
 `fds -V` says which engine a binary has.
 
-```console pcre2
+<!-- examples: pcre2 -->
+```console
 $ fds -E --content -c user plain.arrow 'needle(?!s)'
 plain.arrow:user.name:0:needle
 ```

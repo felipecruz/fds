@@ -117,7 +117,22 @@ pub const Job = struct {
         for (t.path, levels) |field, *l| l.* = try b.batch.level(arena, field, b.columns[field.index]);
         const cursors = try arena.alloc(usize, t.path.len);
         @memset(cursors, 0);
-        var sink: Sink = .{ .f = f, .piece = piece, .matcher = matcher, .first_row = b.first_row, .levels = levels, .cursors = cursors };
+        var sink: Sink = .{
+            .f = f,
+            .piece = piece,
+            .matcher = matcher,
+            .first_row = b.first_row,
+            .levels = levels,
+            .cursors = cursors,
+            .target = t,
+            .batch = b,
+            .arena = arena,
+            .entries = try arena.alloc(usize, t.path.len),
+            .parents = try arena.alloc(usize, t.path.len),
+            .keys = try arena.alloc(?arrow.Strings, t.path.len),
+            .loaded = try arena.alloc(bool, t.path.len),
+        };
+        @memset(sink.loaded, false);
 
         const col = b.columns[t.leaf.index];
         if (t.leaf.dict) |d| {
@@ -288,7 +303,7 @@ fn findStrings(m: Matcher, strings: arrow.Strings, sink: anytype) !void {
 }
 
 // Receives the matching values of one string array, maps them up to their
-// top-level row and records them.
+// top-level row and records them, with their place in the row.
 const Sink = struct {
     f: *const FileSearch,
     piece: *Piece,
@@ -297,6 +312,18 @@ const Sink = struct {
     levels: []const arrow.Level,
     cursors: []usize,
     strings: ?arrow.Strings = null, // null: dictionary values, already checked for nulls
+    target: *const Target,
+    batch: *const BatchWork,
+    arena: Allocator,
+    // Per level, for the value being recorded: its entry in that level's
+    // children, and the entry of the level holding it.
+    entries: []usize,
+    parents: []usize,
+    // Per map level, its keys (loaded at its first match), or null if
+    // they are not strings: positions are printed instead.
+    keys: []?arrow.Strings,
+    loaded: []bool,
+    at: std.ArrayList(u8) = .empty,
 
     pub fn onValue(k: *Sink, i: usize, value: []const u8) !void {
         var j = i;
@@ -307,8 +334,58 @@ const Sink = struct {
         var level = k.levels.len;
         while (level > 0) {
             level -= 1;
+            k.entries[level] = j;
             j = k.levels[level].parent(j, &k.cursors[level]) orelse return;
+            k.parents[level] = j;
         }
-        try k.piece.record(k.f, k.matcher, k.first_row + j, value);
+        const at = if (k.levels.len == 0) k.target.name else try k.place();
+        try k.piece.record(k.f, k.matcher, k.first_row + j, at, value);
+    }
+
+    // The value's place in its row, as `Hit.at`: the target's name with
+    // list positions and map keys filled in: "tags[1]", "m[key]",
+    // "m[key].key", "a[0].b[2]".
+    fn place(k: *Sink) ![]const u8 {
+        const t = k.target;
+        k.at.clearRetainingCapacity();
+        try k.at.appendSlice(k.arena, t.path[0].name);
+        for (t.path, 0..) |field, l| {
+            const child = if (l + 1 < t.path.len) t.path[l + 1] else t.leaf;
+            switch (field.type) {
+                // A map's entries are a struct of key and value: the value
+                // is the map's entry itself, the key is `.key` of it.
+                .@"struct" => if (l == 0 or t.path[l - 1].type != .map or child == &field.children[0]) {
+                    try k.at.print(k.arena, ".{s}", .{child.name});
+                },
+                .map => {
+                    const entry = k.entries[l];
+                    if (try k.mapKeys(l)) |keys| if (entry < keys.len) {
+                        try k.at.append(k.arena, '[');
+                        try search.writeKey(k.arena, &k.at, keys.get(entry));
+                        try k.at.append(k.arena, ']');
+                        continue;
+                    };
+                    try k.at.print(k.arena, "[#{d}]", .{k.levels[l].position(k.parents[l], entry)});
+                },
+                else => try k.at.print(k.arena, "[{d}]", .{k.levels[l].position(k.parents[l], k.entries[l])}),
+            }
+        }
+        return k.at.items;
+    }
+
+    // The keys of the map at level `l`, if they are plain strings.
+    fn mapKeys(k: *Sink, l: usize) !?arrow.Strings {
+        if (!k.loaded[l]) {
+            k.loaded[l] = true;
+            k.keys[l] = null;
+            const entries = k.target.path[l].children;
+            if (entries.len == 1 and entries[0].children.len == 2) {
+                const key = &entries[0].children[0];
+                if (key.type.isString() and key.dict == null) {
+                    k.keys[l] = try k.batch.batch.strings(k.arena, key.type, k.batch.columns[key.index]);
+                }
+            }
+        }
+        return k.keys[l];
     }
 };

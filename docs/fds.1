@@ -29,9 +29,14 @@ itself if it is a file (whatever its name), and prints
 contains \f[I]term\f[R].
 .PP
 Rows are 0\-based and count from the start of the file.
-Columns are paths: \f[I]user.name\f[R] for a struct field,
-\f[I]tags[]\f[R] for the values of a list, \f[I]m[].key\f[R] and
-\f[I]m[].value\f[R] for a map\(cqs.
+The column is the value\(cqs place in its row: \f[I]user.name\f[R] for a
+struct field, \f[I]tags[1]\f[R] for element 1 of a list,
+\f[I]m[key]\f[R] for the value of a map\(cqs entry \f[I]key\f[R] and
+\f[I]m[key].key\f[R] for its key.
+Each matching value is a line.
+Options that take a column (\f[B]\-c\f[R]) and \f[B]\-\-count\f[R] use
+column paths, with positions left out: \f[I]tags[]\f[R],
+\f[I]m[].value\f[R], \f[I]m[].key\f[R].
 Files come out in no fixed order; within a file, matches are ordered by
 row group (or record batch), column, then row.
 .PP
@@ -92,7 +97,8 @@ Stop after \f[I]n\f[R] matches in each file.
 .TP
 \f[B]\-\-json\f[R]
 JSON Lines:
-\f[B]{\(lqpath\(rq,\(lqcolumn\(rq,\(lqrow\(rq,\(lqvalue\(rq}\f[R], or
+\f[B]{\(lqpath\(rq,\(lqcolumn\(rq,\(lqat\(rq,\(lqrow\(rq,\(lqvalue\(rq}\f[R],
+\f[I]column\f[R] being the column path and \f[I]at\f[R] the place, or
 \f[B]{\(lqpath\(rq}\f[R] with \f[B]\-l\f[R] and
 \f[B]{\(lqpath\(rq,\(lqcolumn\(rq,\(lqcount\(rq}\f[R] with
 \f[B]\-\-count\f[R].

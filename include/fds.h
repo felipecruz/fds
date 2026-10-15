@@ -33,9 +33,11 @@ typedef struct fds_match {
     uint64_t row;       /* 0-based row in the file */
     const char *text;   /* the matching value, NUL-terminated (it may contain NULs) */
     size_t text_len;
+    const char *at;     /* its place in the row: "tags[1]", "m[key]", "m[key].key";
+                           the column itself at the top level. NUL-terminated */
 } fds_match;
 
-/* Called once per matching (column, row). Never called concurrently; one
+/* Called once per matching value. Never called concurrently; one
  * file's matches arrive in order (by record batch, column, then row) and
  * files never interleave. `m` and its strings are valid only during the
  * call. Return 0 to continue, nonzero to stop. */

@@ -96,7 +96,7 @@ pub const Summary = struct {
     errors: bool,
 };
 
-/// Called once per matching (column, row), never concurrently, with the
+/// Called once per matching value, never concurrently, with the
 /// matches of one file in order and files never interleaved. Strings are
 /// valid only during the call. Return false to stop the search.
 pub const Callback = struct {
@@ -106,7 +106,8 @@ pub const Callback = struct {
 
 pub const Hit = struct {
     path: []const u8, // "<root>/<relative path>", or the root if it is a file
-    column: []const u8, // column path
+    column: []const u8, // column path: "tags[]", "m[].value"
+    at: []const u8, // the value's place in its row: "tags[1]", "m[key]"; = column at the top level
     row: u64, // 0-based row in the file
     text: []const u8, // the matching value
 };
@@ -310,7 +311,8 @@ pub const Searcher = struct {
                 },
                 .callback => |cb| for (p.hits.items[0..@intCast(n)]) |h| {
                     if (s.stopped.load(.monotonic)) return;
-                    const hit: Hit = .{ .path = f.path, .column = p.column, .row = h.row, .text = p.out.written()[h.start..][0..h.len] };
+                    const out = p.out.written();
+                    const hit: Hit = .{ .path = f.path, .column = p.column, .at = out[h.at_start..][0..h.at_len], .row = h.row, .text = out[h.start..][0..h.len] };
                     if (!cb.f(cb.ctx, hit)) s.stopped.store(true, .monotonic);
                 },
             }
@@ -420,16 +422,19 @@ pub const Piece = struct {
     hits: std.ArrayList(Collected) = .empty, // with `.callback` only
     err: ?anyerror = null,
     last_row: ?u64 = null,
-    count: u64 = 0, // matches recorded
+    count: u64 = 0, // matches recorded: values, or rows with --count
 
-    /// Records a match. Rows arrive in order; several matches in one row
-    /// (list elements) are recorded once. Returns error.Enough when the
-    /// piece has recorded all it could ever report, which stops its search.
-    pub fn record(p: *Piece, f: *const FileSearch, matcher: Matcher, row: u64, value: []const u8) !void {
-        if (p.last_row == row) return;
-        p.last_row = row;
-        p.count += 1;
+    /// Records a match: `value`, at `at` in `row` (see `Hit.at`). Rows
+    /// arrive in order; a row's several matching values (list elements)
+    /// are each a match, except for --count, which counts rows. Returns
+    /// error.Enough when the piece has recorded all it could ever report,
+    /// which stops its search.
+    pub fn record(p: *Piece, f: *const FileSearch, matcher: Matcher, row: u64, at: []const u8, value: []const u8) !void {
         const s = f.s;
+        const same_row = p.last_row == row;
+        p.last_row = row;
+        if (same_row and s.mode() == .count) return;
+        p.count += 1;
         switch (s.output) {
             .print => |o| switch (o.mode) {
                 .matches => {
@@ -439,14 +444,16 @@ pub const Piece = struct {
                         try writeJsonField(out, "path", f.path);
                         try out.writeAll(",");
                         try writeJsonField(out, "column", p.column);
+                        try out.writeAll(",");
+                        try writeJsonField(out, "at", at);
                         try out.print(",\"row\":{d},", .{row});
                         try writeJsonField(out, "value", value);
                         try out.writeAll("}\n");
                     } else {
                         try out.print("{s}{s}{s}:{s}{s}{s}:{s}{d}{s}", .{
-                            color(o, .path),   f.path,   color(o, .reset),
-                            color(o, .column), p.column, color(o, .reset),
-                            color(o, .row),    row,      color(o, .reset),
+                            color(o, .path),   f.path, color(o, .reset),
+                            color(o, .column), at,     color(o, .reset),
+                            color(o, .row),    row,    color(o, .reset),
                         });
                         if (o.content) {
                             try out.writeByte(':');
@@ -462,9 +469,10 @@ pub const Piece = struct {
                 },
             },
             .callback => {
-                const start = p.out.written().len;
+                const at_start = p.out.written().len;
+                try p.out.writer.writeAll(at);
                 try p.out.writer.writeAll(value);
-                try p.hits.append(s.gpa, .{ .row = row, .start = start, .len = value.len });
+                try p.hits.append(s.gpa, .{ .row = row, .at_start = at_start, .at_len = at.len, .start = at_start + at.len, .len = value.len });
             },
         }
         if (s.opts.max_count) |max| if (p.count >= max) return error.Enough;
@@ -476,7 +484,19 @@ pub const Piece = struct {
     }
 };
 
-const Collected = struct { row: u64, start: usize, len: usize };
+const Collected = struct { row: u64, at_start: usize, at_len: usize, start: usize, len: usize };
+
+/// A map key in a value's place (`m[key]`), escaped so the place stays one
+/// unambiguous line: `\` `]` and line breaks as `\\`, `\]`, `\n`, `\r`.
+pub fn writeKey(arena: std.mem.Allocator, out: *std.ArrayList(u8), key: []const u8) !void {
+    for (key) |c| switch (c) {
+        '\\' => try out.appendSlice(arena, "\\\\"),
+        ']' => try out.appendSlice(arena, "\\]"),
+        '\n' => try out.appendSlice(arena, "\\n"),
+        '\r' => try out.appendSlice(arena, "\\r"),
+        else => try out.append(arena, c),
+    };
+}
 
 /// Is a column with this top-level name and full path selected by `-c`?
 pub fn selected(columns: []const []const u8, top: []const u8, name: []const u8) bool {
@@ -639,7 +659,7 @@ const CollectHits = struct {
 
     fn onHit(ctx: ?*anyopaque, hit: Hit) bool {
         const c: *CollectHits = @ptrCast(@alignCast(ctx));
-        const line = std.fmt.allocPrint(c.gpa, "{s}:{s}:{d}:{s}", .{ hit.path, hit.column, hit.row, hit.text }) catch return false;
+        const line = std.fmt.allocPrint(c.gpa, "{s}:{s}:{d}:{s}", .{ hit.path, hit.at, hit.row, hit.text }) catch return false;
         c.hits.append(c.gpa, line) catch return false;
         return true;
     }
@@ -664,15 +684,17 @@ fn expectHits(opts: Options, expected: []const []const u8) !void {
 }
 
 // testdata/make.py documents why each of these matches.
+// A value in a list or map is reported with its place in the row: row 3's
+// tags are ["needle", "needle2"], so both match.
 const table_hits = [_][]const u8{
-    "cat:1:needle",         "cat:4:needle",
-    "m[].key:1:needle",     "m[].value:0:needle",
-    "name:0:needle",        "name:4:a needle here",
-    "note:4:needle\nline",  "pair[]:1:needle",
-    "pair[]:5:needle",      "tags[]:0:needle",
-    "tags[]:3:needle",      "user.name:0:needle",
-    "user.name:4:needles",  "view:1:a long string with needle inside",
-    "view:3:needle",
+    "cat:1:needle",           "cat:4:needle",
+    "m[k]:0:needle",          "m[needle].key:1:needle",
+    "name:0:needle",          "name:4:a needle here",
+    "note:4:needle\nline",    "pair[0]:5:needle",
+    "pair[1]:1:needle",       "tags[0]:3:needle",
+    "tags[1]:0:needle",       "tags[1]:3:needle2",
+    "user.name:0:needle",     "user.name:4:needles",
+    "view:1:a long string with needle inside", "view:3:needle",
 };
 
 test "search the test files" {
@@ -690,7 +712,7 @@ test "search the test files" {
     }
     const polars_hits = [_][]const u8{
         "cat:1:needle",   "name:0:needle", "name:2:a long needle value past twelve bytes",
-        "st.inner:2:needle", "tags[]:1:needle",
+        "st.inner:2:needle", "tags[0]:1:needle",
     };
     for (polars_hits) |h| {
         try expected.append(testing.allocator, try std.fmt.allocPrint(testing.allocator, "testdata/tree/polars.arrow:{s}", .{h}));
@@ -716,10 +738,11 @@ test "search one file: columns, case, regex" {
         file ++ ":user.name:0:needle",
         file ++ ":user.name:4:needles",
     });
-    // A top-level name selects everything under it.
+    // A top-level name selects everything under it. A map value's place
+    // is its key; a key's is itself, then `.key`.
     try expectHits(.{ .root_path = file, .term = "needle", .jobs = 1, .columns = &.{"m"} }, &.{
-        file ++ ":m[].key:1:needle",
-        file ++ ":m[].value:0:needle",
+        file ++ ":m[k]:0:needle",
+        file ++ ":m[needle].key:1:needle",
     });
     try expectHits(.{ .root_path = file, .term = "NEEDLE", .jobs = 1, .ignore_case = true, .columns = &.{"note"} }, &.{
         file ++ ":note:1:NEEDLE",
@@ -728,8 +751,9 @@ test "search one file: columns, case, regex" {
     var re = try regex.Regex.compile(testing.allocator, "^needle.?$", false);
     defer re.deinit();
     try expectHits(.{ .root_path = file, .term = "^needle.?$", .jobs = 2, .regex = &re, .columns = &.{ "tags", "user", "view" } }, &.{
-        file ++ ":tags[]:0:needle",
-        file ++ ":tags[]:3:needle",
+        file ++ ":tags[0]:3:needle",
+        file ++ ":tags[1]:0:needle",
+        file ++ ":tags[1]:3:needle2",
         file ++ ":user.name:0:needle",
         file ++ ":user.name:4:needles",
         file ++ ":view:3:needle",
@@ -793,7 +817,18 @@ test "output modes: -l, --count, -m, --json, colors; the summary" {
     testing.allocator.free(r.text);
 
     r = try printed(.{ .root_path = file, .term = "needle", .jobs = 1, .columns = &.{"note"} }, .{ .file = undefined, .json = true });
-    try testing.expectEqualStrings("{\"path\":\"" ++ file ++ "\",\"column\":\"note\",\"row\":4,\"value\":\"needle\\nline\"}\n", r.text);
+    try testing.expectEqualStrings("{\"path\":\"" ++ file ++ "\",\"column\":\"note\",\"at\":\"note\",\"row\":4,\"value\":\"needle\\nline\"}\n", r.text);
+    testing.allocator.free(r.text);
+
+    // In a list: one line per matching element, `column` the list's,
+    // `at` the element's; --count counts rows (row 3 has two).
+    r = try printed(.{ .root_path = file, .term = "needle", .jobs = 1, .columns = &.{"tags"} }, .{ .file = undefined, .json = true });
+    try testing.expectEqualStrings(
+        "{\"path\":\"" ++ file ++ "\",\"column\":\"tags[]\",\"at\":\"tags[1]\",\"row\":0,\"value\":\"needle\"}\n" ++
+            "{\"path\":\"" ++ file ++ "\",\"column\":\"tags[]\",\"at\":\"tags[0]\",\"row\":3,\"value\":\"needle\"}\n" ++
+            "{\"path\":\"" ++ file ++ "\",\"column\":\"tags[]\",\"at\":\"tags[1]\",\"row\":3,\"value\":\"needle2\"}\n",
+        r.text,
+    );
     testing.allocator.free(r.text);
 
     r = try printed(.{ .root_path = file, .term = "needle", .jobs = 1, .columns = &.{"note"} }, .{ .file = undefined, .content = true, .color = true });

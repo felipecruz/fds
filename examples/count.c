@@ -12,7 +12,7 @@ struct counter {
 
 static int on_match(void *ctx, const fds_match *m) {
     struct counter *c = ctx;
-    if (c->matches < 3) printf("%s:%s:%llu:%s\n", m->path, m->column, (unsigned long long)m->row, m->text);
+    if (c->matches < 3) printf("%s:%s:%llu:%s\n", m->path, m->at, (unsigned long long)m->row, m->text);
     c->matches++;
     return 0; /* keep going */
 }

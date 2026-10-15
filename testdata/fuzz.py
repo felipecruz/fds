@@ -73,7 +73,9 @@ def is_string(t):
 
 
 def hits(name, t, v, term, fold):
-    """Column paths under `name` whose strings in value `v` contain term."""
+    """The places under `name`, as fds prints them, of the strings in value
+    `v` that contain term: `tags[1]` for a list element, `m[key]` for a map
+    value (`m[#2]` if keys aren't strings), `m[key].key` for a key."""
     if v is None:
         return set()
     if is_string(t):
@@ -84,13 +86,20 @@ def hits(name, t, v, term, fold):
         for f in t:
             out |= hits(f"{name}.{f.name}", f.type, v[f.name], term, fold)
     elif pa.types.is_map(t):
-        for k, item in v:
-            out |= hits(f"{name}[].key", pa.string(), k, term, fold)
-            out |= hits(f"{name}[].value", t.item_type, item, term, fold)
+        for i, (k, item) in enumerate(v):
+            place = f"{name}[{escape_key(k)}]" if isinstance(k, str) else f"{name}[#{i}]"
+            out |= hits(f"{place}.key", t.key_type, k, term, fold)
+            out |= hits(place, t.item_type, item, term, fold)
     elif pa.types.is_list(t) or pa.types.is_large_list(t) or pa.types.is_fixed_size_list(t):
-        for item in v:
-            out |= hits(f"{name}[]", t.value_type, item, term, fold)
+        for i, item in enumerate(v):
+            out |= hits(f"{name}[{i}]", t.value_type, item, term, fold)
     return out
+
+
+def escape_key(k):
+    """A map key as fds prints it in a place: backslash, ] and line breaks
+    escaped."""
+    return k.replace("\\", "\\\\").replace("]", "\\]").replace("\n", "\\n").replace("\r", "\\r")
 
 
 def ascii_lower(s):

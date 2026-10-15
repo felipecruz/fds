@@ -54,7 +54,7 @@ $ fds --json parquet/snappy.parquet needle | jq -r .column | sort | uniq -c
       2 name
       1 note
       2 pair[]
-      2 tags[]
+      3 tags[]
       2 user.name
       2 view
 ```
@@ -76,7 +76,7 @@ fds -i ~/.cache/huggingface/datasets 'some phrase'
 #include "fds.h"
 
 static int on_match(void *ctx, const fds_match *m) {
-    printf("%s:%s:%llu:%s\n", m->path, m->column, (unsigned long long)m->row, m->text);
+    printf("%s:%s:%llu:%s\n", m->path, m->at, (unsigned long long)m->row, m->text);
     return 0;   /* nonzero stops the search */
 }
 
@@ -87,5 +87,5 @@ int main(void) {
 
 Flags: `FDS_IGNORE_CASE`, `FDS_REGEX`; threads: 0 for automatic. The
 callback is never called concurrently, and one file's matches arrive
-together, in order. [`examples/count.c`](../examples/count.c) is a
+together, in order. [`examples/count.c`](https://github.com/felipecruz/fds/blob/main/examples/count.c) is a
 complete program: `zig build c-example -- testdata/tree needle`.

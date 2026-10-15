@@ -20,7 +20,7 @@ pub fn find(name: []const u8) ?docs.Topic {
 pub fn writeIndex(w: *Io.Writer, color: bool) !void {
     try w.print("{s}fds help <topic>{s}: the documentation, in the terminal\n\n", .{ on(color, bold), on(color, reset) });
     for (docs.topics) |t| try w.print("  {s}{s: <11}{s} {s}\n", .{ on(color, bold), t.name, on(color, reset), t.summary });
-    try w.writeAll("\nAlso as a man page (man fds), and on GitHub: docs/README.md.\n");
+    try w.writeAll("\nAlso as a man page (man fds), and on the web:\nhttps://felipecruz.github.io/fds/\n");
 }
 
 /// Writes a page of Markdown for a terminal.
@@ -44,6 +44,8 @@ pub fn render(w: *Io.Writer, text: []const u8, color: bool) !void {
             code = !code;
             continue;
         }
+        // Notes for docs/examples.py, and images (the site's demo).
+        if (!code and (std.mem.startsWith(u8, line, "<!--") or std.mem.startsWith(u8, line, "!["))) continue;
         if (code) {
             try w.print("    {s}\n", .{line});
         } else if (std.mem.startsWith(u8, line, "#")) {

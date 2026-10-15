@@ -43,6 +43,25 @@ pub const Column = struct {
     leaf: usize, // position among the schema's leaves, = its chunk in each row group
     max_def: u16, // definition level of a present value
     max_rep: u16, // > 0: in a list or map, so a row may hold several values
+    /// `name` with a 0 byte for each level's brackets, and a map's value
+    /// name left out: "tags\x00", "m\x00", "m\x00.key", "a\x00.b\x00".
+    /// Filled in with a value's position, it is its place in the row.
+    shape: []const u8 = "",
+    levels: []const Level = &.{}, // the repeated fields above it, outermost first
+};
+
+/// A list (or map, or repeated field) above a column.
+pub const Level = struct {
+    def: u16, // the definition level at which an entry at this level exists
+    key: ?usize = null, // a map: the leaf of its keys
+};
+
+/// Where a value sits in its row, in a repeated column: per level, its
+/// index in its list (or map), and which entry at that level it is,
+/// counted from the chunk's start (to find a map's key in the key column).
+pub const Position = struct {
+    index: []const u32 = &.{},
+    entry: []const u64 = &.{},
 };
 
 /// One column of one row group: its pages, in a slice of the file.
@@ -112,7 +131,7 @@ pub fn open(arena: Allocator, bytes: []const u8) Error!File {
     var columns: std.ArrayList(Column) = .empty;
     for (leaves, 0..) |l, i| {
         if (!l.string) continue;
-        try columns.append(arena, .{ .name = l.name, .top = l.top, .leaf = i, .max_def = l.max_def, .max_rep = l.max_rep });
+        try columns.append(arena, .{ .name = l.name, .top = l.top, .leaf = i, .max_def = l.max_def, .max_rep = l.max_rep, .shape = l.shape, .levels = l.levels });
     }
     return .{ .columns = columns.items, .row_groups = groups.items };
 }
@@ -123,6 +142,8 @@ const Leaf = struct {
     max_def: u16,
     max_rep: u16,
     string: bool, // a BYTE_ARRAY annotated as text
+    shape: []const u8,
+    levels: []const Level,
 };
 
 const Element = struct {
@@ -144,7 +165,7 @@ fn parseSchema(arena: Allocator, r: *thrift.Reader, t: thrift.Type) Error![]cons
 
     var leaves: std.ArrayList(Leaf) = .empty;
     var i: usize = 1; // element 0 is the root
-    for (0..elems[0].num_children) |_| try walk(arena, elems, &i, &leaves, "", "", 0, 0, 0, .field);
+    for (0..elems[0].num_children) |_| try walk(arena, elems, &i, &leaves, .{}, 0, .field);
     if (i != elems.len) return error.Malformed;
     return leaves.items;
 }
@@ -154,41 +175,78 @@ const Place = enum {
     field, // a struct field (or top-level column): "<prefix>.<name>"
     list_entry, // the repeated group (or leaf) of a LIST: "<prefix>[]"
     map_entry, // the repeated group of a MAP: "<prefix>[]"
+    map_value, // the value under a MAP's repeated group: "<prefix>.<name>"
     element, // the only child of a LIST's repeated group: the list's values
+};
+
+// What a node passes down to its children.
+const Parent = struct {
+    name: []const u8 = "",
+    shape: []const u8 = "", // see `Column.shape`
+    top: []const u8 = "",
+    def: u16 = 0,
+    levels: []const Level = &.{},
 };
 
 // Names follow Arrow's, so that both formats print the same column paths:
 // a list's values are `tags[]` (whatever the writer called the inner
 // groups: `list.element`, `bag.array`), a map's are `m[].key` and
 // `m[].value`, and a repeated field outside them is `name[]`.
-fn walk(arena: Allocator, elems: []const Element, i: *usize, leaves: *std.ArrayList(Leaf), prefix: []const u8, top: []const u8, def: u16, rep: u16, depth: usize, place: Place) Error!void {
+fn walk(arena: Allocator, elems: []const Element, i: *usize, leaves: *std.ArrayList(Leaf), up: Parent, depth: usize, place: Place) Error!void {
     if (i.* >= elems.len or depth > 64) return error.Malformed;
     const e = elems[i.*];
     i.* += 1;
-    const name = switch (place) {
-        .field => blk: {
-            const n = if (prefix.len == 0) e.name else try std.fmt.allocPrint(arena, "{s}.{s}", .{ prefix, e.name });
-            break :blk if (e.repetition == 2) try std.fmt.allocPrint(arena, "{s}[]", .{n}) else n;
+    const repeated = e.repetition == 2;
+    const joined = if (up.name.len == 0) e.name else try std.fmt.allocPrint(arena, "{s}.{s}", .{ up.name, e.name });
+    const joined_shape = if (up.name.len == 0) e.name else try std.fmt.allocPrint(arena, "{s}.{s}", .{ up.shape, e.name });
+    var name: []const u8 = undefined;
+    var shape: []const u8 = undefined;
+    switch (place) {
+        .field, .map_value => {
+            name = if (repeated) try std.fmt.allocPrint(arena, "{s}[]", .{joined}) else joined;
+            // A map's value is the map's entry itself: `m[key]`.
+            const base = if (place == .map_value) up.shape else joined_shape;
+            shape = if (repeated) try std.fmt.allocPrint(arena, "{s}\x00", .{base}) else base;
         },
-        .list_entry, .map_entry => try std.fmt.allocPrint(arena, "{s}[]", .{prefix}),
-        .element => prefix,
-    };
-    const d = def + @intFromBool(e.repetition != 0); // optional and repeated fields add a level
-    const p = rep + @intFromBool(e.repetition == 2);
-    const t = if (top.len == 0) e.name else top;
+        .list_entry, .map_entry => {
+            name = try std.fmt.allocPrint(arena, "{s}[]", .{up.name});
+            shape = try std.fmt.allocPrint(arena, "{s}\x00", .{up.shape});
+        },
+        .element => {
+            name = up.name;
+            shape = up.shape;
+        },
+    }
+    const d = up.def + @intFromBool(e.repetition != 0); // optional and repeated fields add a level
+    // A repeated field is a level; a MAP's has its keys in its first leaf.
+    var levels = up.levels;
+    if (repeated) levels = try std.mem.concat(arena, Level, &.{ up.levels, &.{.{ .def = d, .key = if (place == .map_entry) leaves.items.len else null }} });
+    const top = if (up.top.len == 0) e.name else up.top;
     if (e.num_children == 0) {
-        try leaves.append(arena, .{ .name = name, .top = t, .max_def = d, .max_rep = p, .string = e.text and e.physical_type == byte_array });
+        try leaves.append(arena, .{
+            .name = name,
+            .top = top,
+            .max_def = d,
+            .max_rep = @intCast(levels.len),
+            .string = e.text and e.physical_type == byte_array,
+            .shape = shape,
+            .levels = levels,
+        });
         return;
     }
-    // A LIST's repeated group with one child holds the values in that
-    // child (the three-level layout); with several, it is itself a struct
-    // of values (an older layout).
-    const child: Place = switch (e.nested) {
-        .list => .list_entry,
-        .map => .map_entry,
-        .none => if (place == .list_entry and e.num_children == 1) .element else .field,
-    };
-    for (0..e.num_children) |_| try walk(arena, elems, i, leaves, name, t, d, p, depth + 1, child);
+    const down: Parent = .{ .name = name, .shape = shape, .top = top, .def = d, .levels = levels };
+    for (0..e.num_children) |c| {
+        // A LIST's repeated group with one child holds the values in that
+        // child (the three-level layout); with several, it is itself a
+        // struct of values (an older layout). A MAP's repeated group holds
+        // the key, then the value.
+        const child: Place = switch (e.nested) {
+            .list => .list_entry,
+            .map => .map_entry,
+            .none => if (place == .list_entry and e.num_children == 1) .element else if (place == .map_entry and c == 1) .map_value else .field,
+        };
+        try walk(arena, elems, i, leaves, down, depth + 1, child);
+    }
 }
 
 const byte_array = 6;
@@ -413,16 +471,20 @@ const PageHeader = struct {
 
 /// Searches a column chunk. `matcher` has `findValues(O, off, data, sink)`,
 /// `matches(value) bool` and `mayMatch(bytes) bool` (false only if no value
-/// in `bytes` can match). `sink.onValue(row, value)` gets each matching
-/// value, `row` being its row within the chunk, in order (several values of
-/// one row in a repeated column come one after another).
+/// in `bytes` can match). `sink.onValue(row, position, value)` gets each
+/// matching value, `row` being its row within the chunk and `position` its
+/// place in the row (see `Position`; valid during the call), in order:
+/// several values of one row in a repeated column come one after another.
 pub fn searchChunk(arena: Allocator, chunk: Chunk, column: Column, matcher: anytype, sink: anytype) !void {
     if (chunk.physical_type != byte_array) return error.Malformed;
+    if (column.levels.len != column.max_rep) return error.Malformed;
     const codec = chunk.codec orelse return error.Unsupported;
     var dict: ?Dictionary = null;
     var pos: usize = 0;
     var entries: usize = 0; // level entries (values and nulls) read so far
-    var rows: usize = 0; // rows started so far
+    var rows: Nest = .{ .index = try arena.alloc(u32, column.max_rep), .entry = try arena.alloc(u64, column.max_rep) };
+    @memset(rows.index, 0);
+    @memset(rows.entry, 0);
     while (pos < chunk.bytes.len and entries < chunk.num_values) {
         var r: thrift.Reader = .{ .buf = chunk.bytes, .pos = pos };
         const h = try PageHeader.parse(&r);
@@ -445,13 +507,39 @@ pub fn searchChunk(arena: Allocator, chunk: Chunk, column: Column, matcher: anyt
     }
 }
 
-fn searchPage(arena: Allocator, codec: codecs.Codec, h: PageHeader, page: []const u8, column: Column, dict: ?*const Dictionary, matcher: anytype, rows: *usize, sink: anytype) !void {
+/// Every present value of a chunk, in order: a map's keys, to show which
+/// key a matching value belongs to.
+pub fn chunkValues(arena: Allocator, chunk: Chunk, column: Column) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    const Collect = struct {
+        out: *std.ArrayList([]const u8),
+        arena: Allocator,
+        pub fn onValue(c: @This(), _: usize, _: Position, value: []const u8) !void {
+            try c.out.append(c.arena, value);
+        }
+    };
+    try searchChunk(arena, chunk, column, everything, Collect{ .out = &out, .arena = arena });
+    return out.items;
+}
+
+// A matcher that matches every value.
+const everything = struct {
+    fn findValues(_: @This(), comptime O: type, off: []align(1) const O, data: []const u8, sink: anytype) !void {
+        if (off.len < 2) return;
+        for (0..off.len - 1) |i| try sink.onValue(i, data[@intCast(off[i])..@intCast(off[i + 1])]);
+    }
+    fn mayMatch(_: @This(), _: []const u8) bool {
+        return true;
+    }
+}{};
+
+fn searchPage(arena: Allocator, codec: codecs.Codec, h: PageHeader, page: []const u8, column: Column, dict: ?*const Dictionary, matcher: anytype, rows: *Nest, sink: anytype) !void {
     // A dictionary page with no matching entry: nothing here can match,
     // so the page is not even decompressed (unless its rows must be
     // counted: in a repeated column, from its levels).
     const no_match = h.encoding.isDictionary() and !(dict orelse return error.Malformed).any;
     if (no_match and column.max_rep == 0) {
-        rows.* += h.num_values;
+        rows.rows += h.num_values;
         return;
     }
 
@@ -473,8 +561,8 @@ fn searchPage(arena: Allocator, codec: codecs.Codec, h: PageHeader, page: []cons
     // Rows: in a repeated column, from the levels, now, since a skipped
     // page's rows count too; otherwise one per entry, and the levels are
     // decoded only if the page can match.
-    var map: RowMap = .{ .slots = null, .base = rows.* };
-    if (column.max_rep > 0) map = try rowsOf(arena, rep_levels, def_levels, column, h.num_values, rows) else rows.* += h.num_values;
+    var map: RowMap = .{ .slots = null, .base = rows.rows };
+    if (column.max_rep > 0) map = try rowsOf(arena, rep_levels, def_levels, column, h.num_values, rows) else rows.rows += h.num_values;
     if (no_match) return;
     if (h.type == .data_v2) {
         if (h.uncompressed < h.rep_len + h.def_len) return error.Malformed;
@@ -485,7 +573,7 @@ fn searchPage(arena: Allocator, codec: codecs.Codec, h: PageHeader, page: []cons
     if (column.max_rep == 0) map.slots = try presentSlots(arena, def_levels, column.max_def, h.num_values);
 
     const n = if (map.slots) |s| s.len else h.num_values;
-    const slot_sink: Slots(@TypeOf(sink)) = .{ .sink = sink, .slots = map.slots, .base = map.base };
+    const slot_sink: Slots(@TypeOf(sink)) = .{ .sink = sink, .map = map, .depth = column.max_rep };
 
     switch (h.encoding) {
         .plain => {
@@ -526,27 +614,46 @@ fn lengthPrefixed(rest: *[]const u8) Error![]const u8 {
 }
 
 // Maps the index of a value among the page's present values to its row
-// in the chunk: `base` + its slot.
+// in the chunk (`base` + its slot) and its position in the row.
 fn Slots(comptime Sink: type) type {
     return struct {
         sink: Sink,
-        slots: ?[]const u32, // null: value i is slot i
-        base: usize,
+        map: RowMap,
+        depth: usize, // repetition levels
         pub fn onValue(s: @This(), i: usize, value: []const u8) !void {
-            try s.sink.onValue(s.base + if (s.slots) |sl| sl[i] else i, value);
+            const m = s.map;
+            const at: Position = if (s.depth == 0) .{} else .{ .index = m.index[i * s.depth ..][0..s.depth], .entry = m.entry[i * s.depth ..][0..s.depth] };
+            try s.sink.onValue(m.base + if (m.slots) |sl| sl[i] else i, at, value);
         }
     };
 }
 
-const RowMap = struct { slots: ?[]const u32, base: usize };
+const RowMap = struct {
+    slots: ?[]const u32,
+    base: usize,
+    // In a repeated column, each present value's `Position`, `depth`
+    // numbers per value.
+    index: []const u32 = &.{},
+    entry: []const u64 = &.{},
+};
+
+// Where the chunk's pages have got to: rows started, and in a repeated
+// column, the current entry at each level (see `Position`).
+const Nest = struct {
+    rows: usize = 0,
+    index: []u32,
+    entry: []u64,
+};
 
 // In a repeated column: where the page's present values (level = max_def)
-// are, as rows of the chunk; `rows` (rows started before the page) is
-// advanced past it. An entry whose repetition level is 0 starts a row and
-// the others continue the last one, which may have started in an earlier
-// page.
-fn rowsOf(arena: Allocator, rep_levels: []const u8, def_levels: []const u8, column: Column, n: usize, rows: *usize) Error!RowMap {
-    const base = rows.*;
+// are, as rows of the chunk and positions in them; `nest` (as of the
+// page's start) is advanced past it. An entry whose repetition level is 0
+// starts a row and the others continue the last one, which may have
+// started in an earlier page. One with level r > 0 is the next element of
+// the list at level r; the lists below it start over.
+fn rowsOf(arena: Allocator, rep_levels: []const u8, def_levels: []const u8, column: Column, n: usize, nest: *Nest) Error!RowMap {
+    const base = nest.rows;
+    const depth: usize = column.max_rep;
     const reps = try hybrid(arena, rep_levels, bitWidth(column.max_rep), n);
     const defs = try hybrid(arena, def_levels, bitWidth(column.max_def), n);
     if (n == 0) return .{ .slots = &.{}, .base = base };
@@ -556,18 +663,27 @@ fn rowsOf(arena: Allocator, rep_levels: []const u8, def_levels: []const u8, colu
     var count: usize = 0;
     for (defs) |l| count += @intFromBool(l == column.max_def);
     const slots = try arena.alloc(u32, count);
+    const index = try arena.alloc(u32, count * depth);
+    const entry = try arena.alloc(u64, count * depth);
     var row: u32 = 0;
     var k: usize = 0;
     for (reps, defs, 0..) |r, d, i| {
         if (r > column.max_rep or d > column.max_def) return error.Malformed;
         if (r == 0 and i > 0) row += 1;
+        for (column.levels, 0..) |l, j| {
+            const level = j + 1;
+            if (r < level) nest.index[j] = 0 else if (r == level) nest.index[j] +|= 1;
+            if (r <= level and d >= l.def) nest.entry[j] += 1;
+        }
         if (d == column.max_def) {
             slots[k] = row;
+            @memcpy(index[k * depth ..][0..depth], nest.index);
+            for (entry[k * depth ..][0..depth], nest.entry) |*e, ne| e.* = std.math.sub(u64, ne, 1) catch return error.Malformed;
             k += 1;
         }
     }
-    rows.* = base - @intFromBool(continues) + row + 1;
-    return .{ .slots = slots, .base = base - @intFromBool(continues) };
+    nest.rows = base - @intFromBool(continues) + row + 1;
+    return .{ .slots = slots, .base = base - @intFromBool(continues), .index = index, .entry = entry };
 }
 
 // The rows (within the page) that hold a value, or null if all do.

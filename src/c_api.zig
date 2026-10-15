@@ -22,6 +22,7 @@ pub const fds_match = extern struct {
     row: u64,
     text: [*:0]const u8,
     text_len: usize,
+    at: [*:0]const u8,
 };
 
 pub const fds_callback = *const fn (ctx: ?*anyopaque, m: *const fds_match) callconv(.c) c_int;
@@ -70,14 +71,14 @@ const State = struct {
     gpa: std.mem.Allocator,
     cb: fds_callback,
     ctx: ?*anyopaque,
-    buf: std.ArrayList(u8) = .empty, // "<path>\0<column>\0<text>\0"
+    buf: std.ArrayList(u8) = .empty, // "<path>\0<column>\0<text>\0<at>\0"
     stopped: bool = false,
     out_of_memory: bool = false,
 
     fn onHit(ptr: ?*anyopaque, hit: search.Hit) bool {
         const s: *State = @ptrCast(@alignCast(ptr));
         s.buf.clearRetainingCapacity();
-        for ([_][]const u8{ hit.path, "\x00", hit.column, "\x00", hit.text, "\x00" }) |part| {
+        for ([_][]const u8{ hit.path, "\x00", hit.column, "\x00", hit.text, "\x00", hit.at, "\x00" }) |part| {
             s.buf.appendSlice(s.gpa, part) catch {
                 s.out_of_memory = true;
                 return false;
@@ -85,12 +86,14 @@ const State = struct {
         }
         const column_start = hit.path.len + 1;
         const text_start = column_start + hit.column.len + 1;
+        const at_start = text_start + hit.text.len + 1;
         const m: fds_match = .{
             .path = @ptrCast(s.buf.items.ptr),
             .column = @ptrCast(s.buf.items[column_start..].ptr),
             .row = hit.row,
             .text = @ptrCast(s.buf.items[text_start..].ptr),
             .text_len = hit.text.len,
+            .at = @ptrCast(s.buf.items[at_start..].ptr),
         };
         if (s.cb(s.ctx, &m) != 0) s.stopped = true;
         return !s.stopped;
@@ -106,7 +109,8 @@ const Rows = struct {
         const r: *Rows = @ptrCast(@alignCast(ctx));
         r.count += 1;
         r.ok = r.ok and std.mem.eql(u8, std.mem.span(m.path), "testdata/tree/plain.arrow") and
-            std.mem.eql(u8, std.mem.span(m.column), "name") and std.mem.span(m.text).len == m.text_len;
+            std.mem.eql(u8, std.mem.span(m.column), "name") and std.mem.eql(u8, std.mem.span(m.at), "name") and
+            std.mem.span(m.text).len == m.text_len;
         return @intFromBool(r.count >= r.stop_after);
     }
 };

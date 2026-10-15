@@ -16,25 +16,26 @@ $ fds parquet/snappy.parquet needle
 parquet/snappy.parquet:name:0
 parquet/snappy.parquet:view:1
 parquet/snappy.parquet:view:3
-parquet/snappy.parquet:tags[]:0
-parquet/snappy.parquet:tags[]:3
+parquet/snappy.parquet:tags[1]:0
+parquet/snappy.parquet:tags[0]:3
+parquet/snappy.parquet:tags[1]:3
 parquet/snappy.parquet:user.name:0
 parquet/snappy.parquet:cat:1
-parquet/snappy.parquet:m[].key:1
-parquet/snappy.parquet:m[].value:0
-parquet/snappy.parquet:pair[]:1
+parquet/snappy.parquet:m[needle].key:1
+parquet/snappy.parquet:m[k]:0
+parquet/snappy.parquet:pair[1]:1
 parquet/snappy.parquet:name:4
 parquet/snappy.parquet:note:4
 parquet/snappy.parquet:user.name:4
 parquet/snappy.parquet:cat:4
-parquet/snappy.parquet:pair[]:5
+parquet/snappy.parquet:pair[0]:5
 ```
 
 - **Rows are 0-based** and count from the start of the file, across row
   groups (Parquet) or record batches (Arrow), so `df.iloc[row]` finds them.
-- **Columns** are paths: a struct field is `user.name`, a list's values
-  are `tags[]`, a map's keys and values are `m[].key` and `m[].value`. See
-  [Columns](columns.md).
+- **The column** is where in the row the value is: a struct field is
+  `user.name`, a list's element 1 is `tags[1]`, a map's value for key
+  `k` is `m[k]`. See [Columns](columns.md).
 - A file is searched whatever its name: the format comes from its first
   bytes.
 
@@ -59,9 +60,9 @@ fds: ./sub/lz4.feather: column u not searched (strings in a union)
 fds: ./sub/zstd.arrow: column u not searched (strings in a union)
 fds: ./truncated.arrow: not a valid Arrow IPC file
 ./sub/lz4.feather
+./sub/zstd.arrow
 ./plain.arrow
 ./deltas.arrows
-./sub/zstd.arrow
 ./polars.arrow
 ./parquet/snappy.parquet
 ./parquet/v2_delta.parquet

@@ -1,6 +1,8 @@
 # Output
 
-The default is one line per matching value, `path:column:row`. The
+The default is one line per matching value, `path:place:row`, the place
+being the value's column, or where it sits in a list or map (`tags[1]`,
+`m[key]`; see [Columns](columns.md)). The
 examples run in `testdata/tree` (see
 [Running the examples](README.md#running-the-examples)).
 
@@ -17,6 +19,8 @@ plain.arrow:note:4:needle\nline
 ## Counts: `--count`
 
 `path:column:count`: how many rows match in each column with matches.
+Columns are column paths (`tags[]`), and a row counts once, however many
+of its list elements match.
 
 ```console
 $ fds --count parquet/snappy.parquet needle
@@ -57,7 +61,9 @@ parquet/snappy.parquet:view:1
 
 ## JSON: `--json`
 
-JSON Lines: one object per match, `{"path","column","row","value"}`. A
+JSON Lines: one object per match, `{"path","column","at","row","value"}`:
+`column` is the column path (`tags[]`), `at` the value's place
+(`tags[1]`). A
 value (or path) that isn't valid UTF-8 comes as `value_base64` (or
 `path_base64`) instead, since a JSON string can't hold arbitrary bytes.
 With `-l` the objects are `{"path"}`; with `--count`,
@@ -65,7 +71,7 @@ With `-l` the objects are `{"path"}`; with `--count`,
 
 ```console
 $ fds --json -c note plain.arrow needle
-{"path":"plain.arrow","column":"note","row":4,"value":"needle\nline"}
+{"path":"plain.arrow","column":"note","at":"note","row":4,"value":"needle\nline"}
 $ fds --json --count -c tags -c cat parquet/snappy.parquet needle
 {"path":"parquet/snappy.parquet","column":"tags[]","count":2}
 {"path":"parquet/snappy.parquet","column":"cat","count":2}
@@ -81,7 +87,7 @@ $ fds --json parquet/snappy.parquet needle | jq -r .column | sort | uniq -c
       2 name
       1 note
       2 pair[]
-      2 tags[]
+      3 tags[]
       2 user.name
       2 view
 ```

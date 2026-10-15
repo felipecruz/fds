@@ -5,7 +5,8 @@ Usage: python3 docs/examples.py [--check]   (after `zig build` and
 
 In each ```console block, every `$ command` line is run with `sh` in
 testdata/tree, with zig-out/release on PATH (zig-out/pcre2/release for
-blocks marked ```console pcre2), and the lines after it are replaced with
+a block right after a `<!-- examples: pcre2 -->` line), and the lines
+after it are replaced with
 what it prints, stderr first. Run it after changing the output or the
 test files, and review the diff.
 
@@ -28,7 +29,7 @@ BINS = {
     "": os.path.join(ROOT, "zig-out", "release"),
     "pcre2": os.path.join(ROOT, "zig-out", "pcre2", "release"),
 }
-BLOCK = re.compile(r"```console([^\n]*)\n(.*?)```", re.S)
+BLOCK = re.compile(r"(<!-- examples: (\w+) -->\n)?```console\n(.*?)```", re.S)
 
 
 def run(cmd, kind):
@@ -64,10 +65,10 @@ def main():
 
         def fill(m):
             nonlocal failed
-            info = m.group(1)
+            marker, kind = m.group(1) or "", m.group(2) or ""
             lines = []
-            for cmd, shown in examples(m.group(2)):
-                got = run(cmd, info.strip())
+            for cmd, shown in examples(m.group(3)):
+                got = run(cmd, kind)
                 if check and normal(got) != normal(shown):
                     failed += 1
                     print(f"{name}: $ {cmd}")
@@ -75,7 +76,7 @@ def main():
                         [s + "\n" for s in shown], [g + "\n" for g in got], "shown", "printed now"))
                 lines.append("$ " + cmd)
                 lines.extend(got)
-            return "```console" + info + "\n" + "\n".join(lines) + "\n```"
+            return marker + "```console\n" + "\n".join(lines) + "\n```"
 
         new = BLOCK.sub(fill, text)
         if not check and new != text:

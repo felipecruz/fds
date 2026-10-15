@@ -47,16 +47,17 @@ parquet/snappy.parquet:tags[]:2
 parquet/snappy.parquet:cat:2
 $ fds -E --content -c name -c tags parquet/snappy.parquet '^needle$'
 parquet/snappy.parquet:name:0:needle
-parquet/snappy.parquet:tags[]:0:needle
-parquet/snappy.parquet:tags[]:3:needle
+parquet/snappy.parquet:tags[1]:0:needle
+parquet/snappy.parquet:tags[0]:3:needle
 $ printf 'haystack\nbob\n' | fds -f - --content parquet/snappy.parquet
 parquet/snappy.parquet:name:3:haystack
 parquet/snappy.parquet:user.name:2:bob
 $ fds --json -c note plain.arrow needle
-{"path":"plain.arrow","column":"note","row":4,"value":"needle\nline"}
+{"path":"plain.arrow","column":"note","at":"note","row":4,"value":"needle\nline"}
 ```
 
-**[The documentation](docs/README.md)** has every option, each example
+**[The documentation](docs/README.md)**, also at
+[felipecruz.github.io/fds](https://felipecruz.github.io/fds/), has every option, each example
 with its real output (CI checks them), and the same pages in the terminal
 (`fds help`) and as a man page (`man fds`).
 
@@ -231,15 +232,16 @@ matching value:
 $ fds data needle --content
 data/events.arrow:name:0:needle
 data/events.arrow:user.name:4:needles
-data/events.arrow:tags[]:3:needle
-data/events.arrow:m[].value:0:needle
+data/events.arrow:tags[1]:3:needle
+data/events.arrow:m[color]:0:needle
 ```
 
 - **Rows are 0-based** and count from the start of the file, across record
   batches or row groups, so `df.iloc[row]` finds them.
-- **Column paths:** a struct field is `user.name`, a list element is
-  `tags[]`, and map keys and values are `m[].key` and `m[].value`. A row
-  whose list holds several matches is reported once.
+- **Where in the row:** a struct field is `user.name`, a list's element 1
+  is `tags[1]`, a map's value for key `color` is `m[color]` (and the key
+  itself `m[color].key`). Each matching value is a line. `-c` and
+  `--count` use column paths, without positions: `tags[]`, `m[].value`.
 - **Order:** files come out in no fixed order. Within a file, matches are
   ordered by record batch, then column, then row; `-m N` keeps the file's
   first N in that order.
@@ -317,7 +319,7 @@ of fds's own regex engine: faster, with fuller syntax, but backtracking
 #include "fds.h"   /* zig-out/include, link zig-out/lib/libfds.a */
 
 static int on_match(void *ctx, const fds_match *m) {
-    printf("%s:%s:%llu:%s\n", m->path, m->column, (unsigned long long)m->row, m->text);
+    printf("%s:%s:%llu:%s\n", m->path, m->at, (unsigned long long)m->row, m->text);
     return 0;   /* nonzero stops the search */
 }
 
@@ -419,7 +421,9 @@ CI (`.github/workflows/ci.yml`) runs all of it on Linux and macOS.
 
 ## More
 
-- [docs/](docs/README.md): the documentation, topic by topic.
+- [docs/](docs/README.md), also at
+  [felipecruz.github.io/fds](https://felipecruz.github.io/fds/): the
+  documentation, topic by topic.
 - [ARCHITECTURE.md](ARCHITECTURE.md): how the code works, from the Arrow
   reader to the SIMD loop.
 - [CHANGELOG.md](CHANGELOG.md).
