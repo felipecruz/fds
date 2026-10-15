@@ -6,7 +6,8 @@
   PCRE2 and its JIT (`third_party/pcre2`, a git submodule, BSD) instead of
   fds's Pike VM. Same matches, behind the same SIMD prefilter; 1.2–4×
   faster on the Arrow log benchmark, 1.1–2.7× on Parquet
-  (`bench/regex.sh`). Full PCRE2 syntax in byte mode. Backtracking is
+  (`bench/regex.sh`); fastest on every Arrow regex search against DuckDB
+  and polars (`bench/regex_others.py`). Full PCRE2 syntax in byte mode. Backtracking is
   bounded per value; a value that hits the bound fails its file's search
   (exit 2). `fds -V` names the engine; compile errors print PCRE2's
   message.

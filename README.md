@@ -44,7 +44,7 @@ cache, AMD Ryzen 9 6950H (8 cores, 16 threads), Linux. All three tools use
 | Rare `host-4242.example` (3,989 rows) | **74 ms** | 230 ms | 488 ms |
 | No match `zqxjv` | **71 ms** | 195 ms | 485 ms |
 | Common `checkout` (4.4 M rows) | **174 ms** | 256 ms | 500 ms |
-| Regex `timeout [a-z]+ token` | **285 ms** | — | 519 ms |
+| Regex `timeout [a-z]+ token` | **285 ms** | 750 ms | 519 ms |
 
 - **About 33 GB/s on an uncompressed file**, close to the memory bandwidth
   of this laptop. The matcher alone runs at about 23 GB/s per core, and
@@ -92,32 +92,56 @@ The script is `bench/parquet.sh`; `bench/others.py` times DuckDB and polars.
 `-E` runs fds's own engine (a Pike VM: linear time, no dependencies) by
 default, or PCRE2 with its JIT when built with `zig build -Dpcre2`. Both
 sit behind the same SIMD literal prefilter and report the same matches.
-The same 20 million rows, warm page cache, 16 threads:
+The same 20 million rows, warm page cache, 16 threads, against DuckDB
+(`regexp_matches`, RE2) and polars (`str.contains`, Rust regex). All four
+find the same matches for every pattern.
 
-| Pattern | Arrow: fds VM | Arrow: PCRE2 | Parquet: fds VM | Parquet: PCRE2 |
+| Arrow (2.3 GB) | fds VM | fds PCRE2 | DuckDB 1.5 | polars 2.0 |
 |:---|---:|---:|---:|---:|
-| `timeout [a-z]+ token` | 265 ms | **93 ms** | 577 ms | **395 ms** |
-| `-w checkout` | 332 ms | **173 ms** | 670 ms | **501 ms** |
-| `\d{5}$` | 1,287 ms | **578 ms** | 1,213 ms | **770 ms** |
-| `[xz]{3}` (no match) | 504 ms | **144 ms** | 692 ms | **415 ms** |
-| `error\|fatal` | 1,520 ms | **384 ms** | 1,799 ms | **665 ms** |
-| `-i TIMEOUT \w+ TOKEN` | 261 ms | **104 ms** | 586 ms | **400 ms** |
-| `^/api/v[0-9]+/checkout/\d+$` | 103 ms | **84 ms** | 323 ms | **301 ms** |
-| `(fast\|slow) (queue\|cache)` | 835 ms | **223 ms** | 1,306 ms | **529 ms** |
+| `timeout [a-z]+ token` | 265 ms | **93 ms** | 750 ms | 527 ms |
+| `-w checkout` (4.5 M matches) | 332 ms | **173 ms** | 1,098 ms | 548 ms |
+| `\d{5}$` (18 M matches) | 1,287 ms | **578 ms** | 717 ms | 599 ms |
+| `[xz]{3}` (no match) | 504 ms | **144 ms** | 1,092 ms | 509 ms |
+| `error\|fatal` (9.5 M matches) | 1,520 ms | **384 ms** | 1,108 ms | 564 ms |
+| `-i TIMEOUT \w+ TOKEN` | 261 ms | **104 ms** | 771 ms | 578 ms |
+| `^/api/v[0-9]+/checkout/\d+$` | 103 ms | **84 ms** | 369 ms | 493 ms |
+| `(fast\|slow) (queue\|cache)` | 835 ms | **223 ms** | 1,106 ms | 558 ms |
 
-- **PCRE2 is 1.2–4× faster on Arrow** and 1.1–2.7× on Parquet, where
-  decompression takes a larger share of the time. It gains the most on
-  alternations and on patterns with no required literal, where most values
-  reach the regex engine.
+| Parquet (Snappy, 707 MB) | fds VM | fds PCRE2 | DuckDB 1.5 | polars 2.0 |
+|:---|---:|---:|---:|---:|
+| `timeout [a-z]+ token` | 577 ms | **395 ms** | 968 ms | 525 ms |
+| `-w checkout` | 670 ms | **501 ms** | 1,300 ms | 530 ms |
+| `\d{5}$` | 1,213 ms | 770 ms | 912 ms | **520 ms** |
+| `[xz]{3}` | 692 ms | **415 ms** | 1,304 ms | 485 ms |
+| `error\|fatal` | 1,799 ms | 665 ms | 1,321 ms | **548 ms** |
+| `-i TIMEOUT \w+ TOKEN` | 586 ms | **400 ms** | 990 ms | 585 ms |
+| `^/api/v[0-9]+/checkout/\d+$` | 323 ms | **301 ms** | 558 ms | 459 ms |
+| `(fast\|slow) (queue\|cache)` | 1,306 ms | **529 ms** | 1,318 ms | 572 ms |
+
+- **With PCRE2, fds is fastest on every Arrow search** and on six of
+  eight Parquet searches. With its own engine, it beats DuckDB on most
+  patterns; on Arrow it loses to polars on alternations and `\d{5}$`, and
+  on Parquet polars is faster on most patterns.
+- **fds prints every match; DuckDB and polars only count rows.** That
+  is most of the time on the patterns that match millions of values. With
+  `--count`, fds PCRE2 takes 279 ms for `\d{5}$` and 228 ms for
+  `error|fatal` on Arrow, and 520 ms and 514 ms on Parquet, even with
+  polars there.
+- **PCRE2 is 1.2–4× faster than fds's engine on Arrow** and 1.1–2.7× on
+  Parquet, where decompression takes a larger share of the time. It gains
+  the most on alternations and on patterns with no required literal,
+  where most values reach the regex engine.
 - **PCRE2 backtracks**, so a pattern like `(a+)+$` can take exponential
   time on some values. Each match is bounded; a value that reaches the
   bound fails the search of its file (exit status 2) instead of being
-  taken as not matching. fds's own engine has no such case.
+  taken as not matching. fds's own engine, RE2 and Rust's regex have no
+  such case.
 - PCRE2 accepts its full syntax (lazy quantifiers, lookaround,
   backreferences), in byte mode with the same semantics for `.`, `$`,
   `\d \w \s \b` and `-i` as fds's engine.
 
-The script is `bench/regex.sh` (results in `results/regex-*.md`).
+The scripts are `bench/regex.sh` (results in `results/regex-*.md`) and
+`bench/regex_others.py`.
 
 ## What gets searched
 
