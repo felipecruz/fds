@@ -8,14 +8,10 @@ usually means loading them into a dataframe or a database first. fds
 searches the files directly, grep-style: point it at a directory and a
 term, and it prints every matching value with its file, column and row.
 
-**Status: experimental.** Formats: Arrow IPC (`.arrow`, `.feather`,
-`.arrows`) and Parquet (`.parquet`). The command line, the output and the C
-library may all change.
+Regexes run on fds's own engine, or optionally on PCRE2, which is faster
+(`zig build -Dpcre2`; see [Regex engines](#regex-engines)).
 
-It is a command-line tool and a C library, about 2,800 lines of Zig. The
-one piece of third-party code is zstd's reference decompressor, built from
-source with the rest (`third_party/`); PCRE2 can be built in too, as an
-optional regex engine. Two ideas make it fast:
+Two ideas make it fast:
 
 1. **Threads:** one task per directory, and inside a file one per piece:
    about 8 MB of one string column.
