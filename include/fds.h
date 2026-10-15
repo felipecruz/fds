@@ -45,7 +45,7 @@ typedef int (*fds_callback)(void *ctx, const fds_match *m);
  * .parquet file under `root`, or of `root` itself if it is a file, for
  * `term`. In Arrow files: utf8, large_utf8 and string_view, dictionary-
  * encoded or not, top-level or inside structs, lists and maps. In Parquet
- * files: string columns, top-level or inside structs (not lists yet).
+ * files: string columns, top-level or inside structs, lists and maps.
  * Files that can't be read are skipped.
  * `threads` = 0 means automatic: the performance-core count on Apple
  * silicon, else the CPU count. Blocks until done. */

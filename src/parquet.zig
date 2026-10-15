@@ -9,9 +9,10 @@
 //! values in one of several encodings.
 //!
 //! Searched: BYTE_ARRAY columns annotated as strings (STRING, ENUM, JSON;
-//! or UTF8/ENUM/JSON converted types) with no repeated field above them, so
-//! that every value is one row: top-level columns and struct fields
-//! (`user.name`). Lists are not searched yet.
+//! or UTF8/ENUM/JSON converted types), at the top level, in structs
+//! (`user.name`), and in lists and maps (`tags[]`, `m[].key`), at any
+//! depth. In a repeated column, the repetition levels say where each row
+//! starts; a match is reported as its row, once per row.
 //!
 //! Pages are skipped without being decompressed when they can't match: a
 //! dictionary-encoded page when no dictionary entry matched, and a
@@ -41,6 +42,7 @@ pub const Column = struct {
     top: []const u8, // its first part: the top-level column
     leaf: usize, // position among the schema's leaves, = its chunk in each row group
     max_def: u16, // definition level of a present value
+    max_rep: u16, // > 0: in a list or map, so a row may hold several values
 };
 
 /// One column of one row group: its pages, in a slice of the file.
@@ -109,8 +111,8 @@ pub fn open(arena: Allocator, bytes: []const u8) Error!File {
 
     var columns: std.ArrayList(Column) = .empty;
     for (leaves, 0..) |l, i| {
-        if (!l.string or l.max_rep > 0) continue;
-        try columns.append(arena, .{ .name = l.name, .top = l.top, .leaf = i, .max_def = l.max_def });
+        if (!l.string) continue;
+        try columns.append(arena, .{ .name = l.name, .top = l.top, .leaf = i, .max_def = l.max_def, .max_rep = l.max_rep });
     }
     return .{ .columns = columns.items, .row_groups = groups.items };
 }
@@ -129,6 +131,7 @@ const Element = struct {
     repetition: i32 = 0, // REQUIRED 0, OPTIONAL 1, REPEATED 2
     num_children: usize = 0,
     text: bool = false,
+    nested: enum { none, list, map } = .none, // a LIST or MAP annotation
 };
 
 // The schema is a flattened tree: a pre-order list of elements, where each
@@ -141,16 +144,35 @@ fn parseSchema(arena: Allocator, r: *thrift.Reader, t: thrift.Type) Error![]cons
 
     var leaves: std.ArrayList(Leaf) = .empty;
     var i: usize = 1; // element 0 is the root
-    for (0..elems[0].num_children) |_| try walk(arena, elems, &i, &leaves, "", "", 0, 0, 0);
+    for (0..elems[0].num_children) |_| try walk(arena, elems, &i, &leaves, "", "", 0, 0, 0, .field);
     if (i != elems.len) return error.Malformed;
     return leaves.items;
 }
 
-fn walk(arena: Allocator, elems: []const Element, i: *usize, leaves: *std.ArrayList(Leaf), prefix: []const u8, top: []const u8, def: u16, rep: u16, depth: usize) Error!void {
+// How an element is named, from where it sits.
+const Place = enum {
+    field, // a struct field (or top-level column): "<prefix>.<name>"
+    list_entry, // the repeated group (or leaf) of a LIST: "<prefix>[]"
+    map_entry, // the repeated group of a MAP: "<prefix>[]"
+    element, // the only child of a LIST's repeated group: the list's values
+};
+
+// Names follow Arrow's, so that both formats print the same column paths:
+// a list's values are `tags[]` (whatever the writer called the inner
+// groups: `list.element`, `bag.array`), a map's are `m[].key` and
+// `m[].value`, and a repeated field outside them is `name[]`.
+fn walk(arena: Allocator, elems: []const Element, i: *usize, leaves: *std.ArrayList(Leaf), prefix: []const u8, top: []const u8, def: u16, rep: u16, depth: usize, place: Place) Error!void {
     if (i.* >= elems.len or depth > 64) return error.Malformed;
     const e = elems[i.*];
     i.* += 1;
-    const name = if (prefix.len == 0) e.name else try std.fmt.allocPrint(arena, "{s}.{s}", .{ prefix, e.name });
+    const name = switch (place) {
+        .field => blk: {
+            const n = if (prefix.len == 0) e.name else try std.fmt.allocPrint(arena, "{s}.{s}", .{ prefix, e.name });
+            break :blk if (e.repetition == 2) try std.fmt.allocPrint(arena, "{s}[]", .{n}) else n;
+        },
+        .list_entry, .map_entry => try std.fmt.allocPrint(arena, "{s}[]", .{prefix}),
+        .element => prefix,
+    };
     const d = def + @intFromBool(e.repetition != 0); // optional and repeated fields add a level
     const p = rep + @intFromBool(e.repetition == 2);
     const t = if (top.len == 0) e.name else top;
@@ -158,7 +180,15 @@ fn walk(arena: Allocator, elems: []const Element, i: *usize, leaves: *std.ArrayL
         try leaves.append(arena, .{ .name = name, .top = t, .max_def = d, .max_rep = p, .string = e.text and e.physical_type == byte_array });
         return;
     }
-    for (0..e.num_children) |_| try walk(arena, elems, i, leaves, name, t, d, p, depth + 1);
+    // A LIST's repeated group with one child holds the values in that
+    // child (the three-level layout); with several, it is itself a struct
+    // of values (an older layout).
+    const child: Place = switch (e.nested) {
+        .list => .list_entry,
+        .map => .map_entry,
+        .none => if (place == .list_entry and e.num_children == 1) .element else .field,
+    };
+    for (0..e.num_children) |_| try walk(arena, elems, i, leaves, name, t, d, p, depth + 1, child);
 }
 
 const byte_array = 6;
@@ -173,17 +203,26 @@ fn parseElement(r: *thrift.Reader) Error!Element {
         3 => e.repetition = try r.int(i32, f.type),
         4 => e.name = try r.binary(f.type),
         5 => e.num_children = try r.int(usize, f.type),
-        // ConvertedType: UTF8 0, ENUM 4, JSON 19.
-        6 => e.text = e.text or switch (try r.int(i32, f.type)) {
-            0, 4, 19 => true,
-            else => false,
+        // ConvertedType: UTF8 0, MAP 1, LIST 3, ENUM 4, JSON 19. (MAP_KEY_VALUE,
+        // 2, marks the repeated group inside a MAP: already an entry.)
+        6 => switch (try r.int(i32, f.type)) {
+            0, 4, 19 => e.text = true,
+            1 => e.nested = .map,
+            3 => e.nested = .list,
+            else => {},
         },
-        // LogicalType is a union: the set field says which. STRING 1, ENUM 4, JSON 12.
+        // LogicalType is a union: the set field says which. STRING 1, MAP 2,
+        // LIST 3, ENUM 4, JSON 12.
         10 => {
             if (f.type != .@"struct") return error.Malformed;
             var last_lt: i16 = 0;
             while (try r.field(&last_lt)) |lt| {
-                if (lt.id == 1 or lt.id == 4 or lt.id == 12) e.text = true;
+                switch (lt.id) {
+                    1, 4, 12 => e.text = true,
+                    2 => e.nested = .map,
+                    3 => e.nested = .list,
+                    else => {},
+                }
                 try r.skip(lt.type);
             }
         },
@@ -374,15 +413,17 @@ const PageHeader = struct {
 
 /// Searches a column chunk. `matcher` has `findValues(O, off, data, sink)`,
 /// `matches(value) bool` and `mayMatch(bytes) bool` (false only if no value
-/// in `bytes` can match). `sink.onValue(slot, value)` gets each matching
-/// value, `slot` being its row within the chunk, in order.
+/// in `bytes` can match). `sink.onValue(row, value)` gets each matching
+/// value, `row` being its row within the chunk, in order (several values of
+/// one row in a repeated column come one after another).
 pub fn searchChunk(arena: Allocator, chunk: Chunk, column: Column, matcher: anytype, sink: anytype) !void {
     if (chunk.physical_type != byte_array) return error.Malformed;
     const codec = chunk.codec orelse return error.Unsupported;
     var dict: ?Dictionary = null;
     var pos: usize = 0;
-    var slot: usize = 0; // row of the next page's first value
-    while (pos < chunk.bytes.len and slot < chunk.num_values) {
+    var entries: usize = 0; // level entries (values and nulls) read so far
+    var rows: usize = 0; // rows started so far
+    while (pos < chunk.bytes.len and entries < chunk.num_values) {
         var r: thrift.Reader = .{ .buf = chunk.bytes, .pos = pos };
         const h = try PageHeader.parse(&r);
         if (h.compressed > chunk.bytes.len - r.pos) return error.Malformed;
@@ -396,61 +437,55 @@ pub fn searchChunk(arena: Allocator, chunk: Chunk, column: Column, matcher: anyt
             },
             .data, .data_v2 => {
                 if (h.num_values > max_page_values) return error.Unsupported;
-                try searchPage(arena, codec, h, page, column, if (dict) |*d| d else null, matcher, Offset(@TypeOf(sink)){ .sink = sink, .base = slot });
-                slot += h.num_values;
+                try searchPage(arena, codec, h, page, column, if (dict) |*d| d else null, matcher, &rows, sink);
+                entries += h.num_values;
             },
             else => {}, // index pages
         }
     }
 }
 
-// Adds the page's first row to every slot.
-fn Offset(comptime Sink: type) type {
-    return struct {
-        sink: Sink,
-        base: usize,
-        fn onValue(o: @This(), slot: usize, value: []const u8) !void {
-            try o.sink.onValue(o.base + slot, value);
-        }
-    };
-}
-
-fn searchPage(arena: Allocator, codec: codecs.Codec, h: PageHeader, page: []const u8, column: Column, dict: ?*const Dictionary, matcher: anytype, sink: anytype) !void {
+fn searchPage(arena: Allocator, codec: codecs.Codec, h: PageHeader, page: []const u8, column: Column, dict: ?*const Dictionary, matcher: anytype, rows: *usize, sink: anytype) !void {
     // A dictionary page with no matching entry: nothing here can match,
-    // so the page is not even decompressed.
-    if (h.encoding.isDictionary()) {
-        const d = dict orelse return error.Malformed;
-        if (!d.any) return;
+    // so the page is not even decompressed (unless its rows must be
+    // counted: in a repeated column, from its levels).
+    const no_match = h.encoding.isDictionary() and !(dict orelse return error.Malformed).any;
+    if (no_match and column.max_rep == 0) {
+        rows.* += h.num_values;
+        return;
     }
 
-    // Definition levels, then values.
+    // Repetition levels, definition levels, then values.
+    var rep_levels: []const u8 = "";
     var def_levels: []const u8 = "";
     var values: []const u8 = undefined;
     if (h.type == .data) {
-        const data = try codecs.decompress(arena, codec, page, h.uncompressed);
-        var rest = data;
-        if (column.max_def > 0) {
-            if (rest.len < 4) return error.Malformed;
-            const len = std.mem.readInt(u32, rest[0..4], .little);
-            if (len > rest.len - 4) return error.Malformed;
-            def_levels = rest[4..][0..len];
-            rest = rest[4 + len ..];
-        }
+        var rest = try codecs.decompress(arena, codec, page, h.uncompressed);
+        if (column.max_rep > 0) rep_levels = try lengthPrefixed(&rest);
+        if (column.max_def > 0) def_levels = try lengthPrefixed(&rest);
         values = rest;
     } else {
         if (h.rep_len > page.len or h.def_len > page.len - h.rep_len) return error.Malformed;
+        rep_levels = page[0..h.rep_len];
         def_levels = page[h.rep_len..][0..h.def_len];
-        const rest = page[h.rep_len + h.def_len ..];
+        values = page[h.rep_len + h.def_len ..];
+    }
+    // Rows: in a repeated column, from the levels, now, since a skipped
+    // page's rows count too; otherwise one per entry, and the levels are
+    // decoded only if the page can match.
+    var map: RowMap = .{ .slots = null, .base = rows.* };
+    if (column.max_rep > 0) map = try rowsOf(arena, rep_levels, def_levels, column, h.num_values, rows) else rows.* += h.num_values;
+    if (no_match) return;
+    if (h.type == .data_v2) {
         if (h.uncompressed < h.rep_len + h.def_len) return error.Malformed;
         const n = h.uncompressed - h.rep_len - h.def_len;
-        values = if (h.values_compressed and codec != .none) try codecs.decompress(arena, codec, rest, n) else rest;
+        if (h.values_compressed and codec != .none) values = try codecs.decompress(arena, codec, values, n);
     }
     if (h.encoding == .plain and !matcher.mayMatch(values)) return;
+    if (column.max_rep == 0) map.slots = try presentSlots(arena, def_levels, column.max_def, h.num_values);
 
-    // Which rows hold a value: those whose level is the maximum.
-    const slots = try presentSlots(arena, def_levels, column.max_def, h.num_values);
-    const n = if (slots) |s| s.len else h.num_values;
-    const slot_sink: Slots(@TypeOf(sink)) = .{ .sink = sink, .slots = slots };
+    const n = if (map.slots) |s| s.len else h.num_values;
+    const slot_sink: Slots(@TypeOf(sink)) = .{ .sink = sink, .slots = map.slots, .base = map.base };
 
     switch (h.encoding) {
         .plain => {
@@ -480,15 +515,59 @@ fn searchPage(arena: Allocator, codec: codecs.Codec, h: PageHeader, page: []cons
     }
 }
 
-// Maps the index of a value among the page's present values to its row.
+// Levels in a v1 data page: a 4-byte length, then RLE/bit-packed levels.
+fn lengthPrefixed(rest: *[]const u8) Error![]const u8 {
+    if (rest.len < 4) return error.Malformed;
+    const len = std.mem.readInt(u32, rest.*[0..4], .little);
+    if (len > rest.len - 4) return error.Malformed;
+    const levels = rest.*[4..][0..len];
+    rest.* = rest.*[4 + len ..];
+    return levels;
+}
+
+// Maps the index of a value among the page's present values to its row
+// in the chunk: `base` + its slot.
 fn Slots(comptime Sink: type) type {
     return struct {
         sink: Sink,
-        slots: ?[]const u32, // null: every row has a value
+        slots: ?[]const u32, // null: value i is slot i
+        base: usize,
         pub fn onValue(s: @This(), i: usize, value: []const u8) !void {
-            try s.sink.onValue(if (s.slots) |sl| sl[i] else i, value);
+            try s.sink.onValue(s.base + if (s.slots) |sl| sl[i] else i, value);
         }
     };
+}
+
+const RowMap = struct { slots: ?[]const u32, base: usize };
+
+// In a repeated column: where the page's present values (level = max_def)
+// are, as rows of the chunk; `rows` (rows started before the page) is
+// advanced past it. An entry whose repetition level is 0 starts a row and
+// the others continue the last one, which may have started in an earlier
+// page.
+fn rowsOf(arena: Allocator, rep_levels: []const u8, def_levels: []const u8, column: Column, n: usize, rows: *usize) Error!RowMap {
+    const base = rows.*;
+    const reps = try hybrid(arena, rep_levels, bitWidth(column.max_rep), n);
+    const defs = try hybrid(arena, def_levels, bitWidth(column.max_def), n);
+    if (n == 0) return .{ .slots = &.{}, .base = base };
+    // Slot 0 is the row the page's first entry belongs to.
+    const continues = reps[0] != 0;
+    if (continues and base == 0) return error.Malformed; // no row to continue
+    var count: usize = 0;
+    for (defs) |l| count += @intFromBool(l == column.max_def);
+    const slots = try arena.alloc(u32, count);
+    var row: u32 = 0;
+    var k: usize = 0;
+    for (reps, defs, 0..) |r, d, i| {
+        if (r > column.max_rep or d > column.max_def) return error.Malformed;
+        if (r == 0 and i > 0) row += 1;
+        if (d == column.max_def) {
+            slots[k] = row;
+            k += 1;
+        }
+    }
+    rows.* = base - @intFromBool(continues) + row + 1;
+    return .{ .slots = slots, .base = base - @intFromBool(continues) };
 }
 
 // The rows (within the page) that hold a value, or null if all do.

@@ -27,6 +27,7 @@ const Regex = re_engine.Regex;
 //   parquet.zig Parquet footer, schema, pages and encodings (thrift.zig)
 //   codecs.zig  decompression: LZ4 (lz4.zig), Snappy (snappy.zig), zstd, gzip
 //   match.zig   finding the term in a string array (SIMD), no I/O
+//   multi.zig   many terms at once (-f): Aho-Corasick
 //   regex.zig   regex: parser, Pike VM, SIMD literal prefilter
 //
 // `-j N` sets the number of worker threads; `-j 1` is fully serial. The
@@ -45,7 +46,8 @@ pub fn main(init: std.process.Init) !void {
     var color: enum { auto, always, never } = .auto;
     var flags: pattern.Flags = .{};
     var max_count: ?u64 = null;
-    var terms: std.ArrayList([]const u8) = .empty; // from -e
+    var terms: std.ArrayList([]const u8) = .empty; // from -e and -f
+    var from_file = false;
     var columns: std.ArrayList([]const u8) = .empty;
     var pos: std.ArrayList([]const u8) = .empty;
     var i: usize = 1;
@@ -82,6 +84,9 @@ pub fn main(init: std.process.Init) !void {
             print.json = true;
         } else if (eql(a, "-e", "--regexp")) {
             try terms.append(arena, value(args, &i));
+        } else if (eql(a, "-f", "--file")) {
+            try readTerms(init.io, arena, value(args, &i), &terms);
+            from_file = true;
         } else if (eql(a, "-c", "--column")) {
             try columns.append(arena, value(args, &i));
         } else if (eql(a, "-m", "--max-count")) {
@@ -96,7 +101,11 @@ pub fn main(init: std.process.Init) !void {
         } else usage(2);
     }
 
-    // `fds <path> <term>`, or `fds -e <term>... <path>`.
+    // `fds <path> <term>`, or `fds -e <term>... <path>` (or -f).
+    if (terms.items.len == 0 and from_file) {
+        std.debug.print("fds: no terms in the -f file\n", .{});
+        std.process.exit(2);
+    }
     if (terms.items.len == 0) {
         if (pos.items.len != 2) usage(2);
         try terms.append(arena, pos.items[1]);
@@ -128,6 +137,7 @@ pub fn main(init: std.process.Init) !void {
         .root_path = root_path,
         .term = p.source,
         .terms = if (p.literals.len > 1) p.literals else &.{},
+        .word = p.word,
         .jobs = if (jobs == 0) search.autoJobs() else jobs,
         .ignore_case = p.ignore_case,
         .regex = if (re) |*r| r else null,
@@ -139,6 +149,30 @@ pub fn main(init: std.process.Init) !void {
     };
     // As grep: 0 if something matched, 1 if nothing did, 2 on any error.
     std.process.exit(if (summary.errors) 2 else if (summary.matched) 0 else 1);
+}
+
+// Adds the terms in a file (`-` for stdin), one per line. A line's
+// trailing \r is dropped, and so are empty lines: an empty term would match
+// every value.
+fn readTerms(io: std.Io, arena: std.mem.Allocator, path: []const u8, terms: *std.ArrayList([]const u8)) !void {
+    const text = blk: {
+        if (std.mem.eql(u8, path, "-")) {
+            var buf: [4096]u8 = undefined;
+            var r = std.Io.File.stdin().reader(io, &buf);
+            break :blk r.interface.allocRemaining(arena, .unlimited) catch |err| fail(path, err);
+        }
+        break :blk std.Io.Dir.cwd().readFileAlloc(io, path, arena, .unlimited) catch |err| fail(path, err);
+    };
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const t = std.mem.trimEnd(u8, line, "\r");
+        if (t.len > 0) try terms.append(arena, t);
+    }
+}
+
+fn fail(path: []const u8, err: anyerror) noreturn {
+    std.debug.print("fds: {s}: {t}\n", .{ path, err });
+    std.process.exit(2);
 }
 
 fn eql(a: []const u8, short: []const u8, long: ?[]const u8) bool {
@@ -156,6 +190,7 @@ fn usage(status: u8) noreturn {
     std.debug.print(
         \\usage: fds [options] <path> <term>
         \\       fds [options] -e <term> [-e <term>]... <path>
+        \\       fds [options] -f <file> <path>
         \\  Searches the string values of every .arrow, .feather, .arrows and
         \\  .parquet file under <path> (or the file <path>), printing
         \\  <path>:<column>:<row> for each match.
@@ -166,6 +201,8 @@ fn usage(status: u8) noreturn {
         \\  -E, --regex          terms are regular expressions (see src/regex.zig)
         \\  -w, --word           match whole words only
         \\  -e, --regexp TERM    a term to search for; repeat for any of several
+        \\  -f, --file FILE      terms, one per line (- for stdin); any may match
+        \\                       (thousands are fine: one pass searches them all)
         \\  -c, --column NAME    search only this column (a top-level name or a
         \\                       path like user.name or tags[]); repeatable
         \\output:
@@ -200,6 +237,7 @@ test {
     _ = @import("thrift.zig");
     _ = @import("zstd.zig");
     _ = @import("match.zig");
+    _ = @import("multi.zig");
     _ = @import("regex.zig");
     _ = @import("re.zig");
     if (re_engine.pcre2) _ = @import("pcre2.zig");

@@ -5,6 +5,10 @@
 //! SIMD prefilter still runs on a regex's required literal (`needle` in
 //! `\bneedle\b`). `-S` (smart case) picks case-insensitive matching when no
 //! term has an upper-case letter.
+//!
+//! From `many` literal terms on, they are searched together by an
+//! Aho-Corasick automaton (multi.zig) instead of one SIMD pass each, `-w`
+//! included: a regex of thousands of alternatives would be slow.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -16,6 +20,9 @@ pub const Flags = struct {
     smart_case: bool = false, // -S
 };
 
+/// From this many literal terms, one automaton beats a SIMD pass per term.
+pub const many = 8;
+
 pub const Pattern = struct {
     /// The regex's source with `regex`; else the literals, any of which may
     /// match (usually one).
@@ -23,6 +30,8 @@ pub const Pattern = struct {
     literals: []const []const u8,
     regex: bool,
     ignore_case: bool,
+    /// With `literals`: each must match as a whole word.
+    word: bool = false,
 };
 
 pub fn build(arena: Allocator, terms: []const []const u8, flags: Flags) !Pattern {
@@ -34,6 +43,7 @@ pub fn build(arena: Allocator, terms: []const []const u8, flags: Flags) !Pattern
         } else true;
     }
     if (!flags.word and (terms.len == 1 or !flags.regex)) return .{ .source = terms[0], .literals = terms, .regex = flags.regex, .ignore_case = fold };
+    if (flags.word and !flags.regex and terms.len >= many) return .{ .source = terms[0], .literals = terms, .regex = false, .ignore_case = fold, .word = true };
 
     var out: std.ArrayList(u8) = .empty;
     for (terms, 0..) |t, i| {
@@ -134,6 +144,12 @@ test "smart case, words, several terms" {
     try testing.expect(try matches(e, "f(x)"));
     try testing.expect(try matches(e, "tab\there"));
     try testing.expect(!try matches(e, "nothing"));
+
+    // -w with many literals: they stay literals, for the automaton.
+    const many_words = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h" };
+    try testing.expect(many_words.len >= many);
+    const mw = try build(a, &many_words, .{ .word = true });
+    try testing.expect(!mw.regex and mw.word and mw.literals.len == many_words.len);
 
     // -e with -E: any of the regexes; with -w, as whole words.
     const ew = try build(a, &.{ "ne+dle", "hay" }, .{ .regex = true, .word = true });

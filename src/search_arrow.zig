@@ -34,8 +34,10 @@ pub fn plan(f: *FileSearch, arena: Allocator, matcher: Matcher) !void {
             if (file != null) return error.Malformed;
             const schema = try arrow.parseSchema(arena, msg.header);
             const fl = try arena.create(File);
-            fl.* = .{ .schema = schema, .targets = try findTargets(arena, schema, f.s.opts.columns) };
+            var skipped: std.ArrayList(Skipped) = .empty;
+            fl.* = .{ .schema = schema, .targets = try findTargets(arena, schema, f.s.opts.columns, &skipped) };
             file = fl;
+            for (skipped.items) |k| f.s.notSearched(f.path, k.name, k.why);
             if (fl.targets.len == 0) return; // no string values to search
         },
         .dictionary => {
@@ -170,9 +172,19 @@ const Target = struct {
     path: []const *const arrow.Field, // nested fields above `leaf`, outermost first
 };
 
-fn findTargets(arena: Allocator, schema: arrow.Schema, columns: []const []const u8) ![]const Target {
+// A field holding strings that fds can't search (see `addTargets`).
+const Skipped = struct { name: []const u8, why: []const u8 };
+
+// The string arrays to search, among the columns selected by `-c`. Those
+// fds can't search go to `skipped`, to be reported.
+fn findTargets(arena: Allocator, schema: arrow.Schema, columns: []const []const u8, skipped: *std.ArrayList(Skipped)) ![]const Target {
     var all: std.ArrayList(Target) = .empty;
-    for (schema.fields) |*f| try addTargets(arena, &all, f, f.name, &.{});
+    var not: std.ArrayList(Skipped) = .empty;
+    for (schema.fields) |*f| {
+        const from = not.items.len;
+        try addTargets(arena, &all, &not, f, f.name, &.{});
+        for (not.items[from..]) |k| if (search.selected(columns, f.name, k.name)) try skipped.append(arena, k);
+    }
     var kept: std.ArrayList(Target) = .empty;
     for (all.items) |t| {
         const top = if (t.path.len > 0) t.path[0].name else t.leaf.name;
@@ -181,14 +193,25 @@ fn findTargets(arena: Allocator, schema: arrow.Schema, columns: []const []const 
     return kept.items;
 }
 
-fn addTargets(arena: Allocator, list: *std.ArrayList(Target), f: *const arrow.Field, name: []const u8, path: []const *const arrow.Field) !void {
+fn addTargets(arena: Allocator, list: *std.ArrayList(Target), skipped: *std.ArrayList(Skipped), f: *const arrow.Field, name: []const u8, path: []const *const arrow.Field) !void {
     // A dictionary-encoded field's type is the type of its values.
     if (f.type.isString()) return list.append(arena, .{ .name = name, .leaf = f, .path = path });
     if (f.dict != null) return;
     const list_like = switch (f.type) {
         .list, .large_list, .fixed_size_list, .map => true,
         .@"struct" => false,
-        else => return, // no strings searched in unions, run-end encoded or list views
+        // Their rows don't map to their children's entries one to one (or
+        // in order), which the search needs: strings in them are reported
+        // as not searched instead.
+        .@"union", .run_end_encoded, .list_view, .large_list_view => {
+            if (hasStrings(f)) try skipped.append(arena, .{ .name = name, .why = switch (f.type) {
+                .@"union" => "strings in a union",
+                .run_end_encoded => "strings in a run-end encoded array",
+                else => "strings in a list view",
+            } });
+            return;
+        },
+        else => return,
     };
     const sub = try std.mem.concat(arena, *const arrow.Field, &.{ path, &.{f} });
     for (f.children) |*c| {
@@ -196,8 +219,14 @@ fn addTargets(arena: Allocator, list: *std.ArrayList(Target), f: *const arrow.Fi
             try std.fmt.allocPrint(arena, "{s}[]", .{name})
         else
             try std.fmt.allocPrint(arena, "{s}.{s}", .{ name, c.name });
-        try addTargets(arena, list, c, child_name, sub);
+        try addTargets(arena, list, skipped, c, child_name, sub);
     }
+}
+
+fn hasStrings(f: *const arrow.Field) bool {
+    if (f.type.isString()) return true;
+    for (f.children) |*c| if (hasStrings(c)) return true;
+    return false;
 }
 
 // The values of one dictionary, with the keys whose value matches. Values

@@ -53,12 +53,11 @@ def expected_matches(root, term, fold):
             continue
         rows_total += table.num_rows
         needle = ascii_lower(term) if fold else term
-        lists = not path.endswith(".parquet")  # fds doesn't search lists in Parquet yet
         # Paths as fds prints them: "<root>/<relative path>", or the root.
         shown = path if os.path.isfile(root) else root.rstrip("/") + "/" + os.path.relpath(path, root)
         for row_index, row in enumerate(table.to_pylist()):
             for f in table.schema:
-                for col in hits(f.name, f.type, row[f.name], needle, fold, lists):
+                for col in hits(f.name, f.type, row[f.name], needle, fold):
                     expected.add(f"{shown}:{col}:{row_index}")
     return expected, bad, rows_total
 

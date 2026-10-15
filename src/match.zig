@@ -80,7 +80,7 @@ pub fn indexOf(comptime case: Case, value: []const u8, term: []const u8, from: u
 // The row whose value holds byte `pos`: the last r >= `from` with
 // off[r] <= pos. Hits arrive in increasing order, so each search starts at
 // the previous row. Requires off[from] <= pos < off[off.len - 1].
-fn rowOf(comptime O: type, off: []align(1) const O, from: usize, pos: usize) usize {
+pub fn rowOf(comptime O: type, off: []align(1) const O, from: usize, pos: usize) usize {
     var lo = from + 1; // first index that may hold an offset > pos
     var hi = off.len - 1; // off[hi] > pos
     while (lo < hi) {

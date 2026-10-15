@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **Parquet: strings in lists and maps are searched**, at any depth
+  (`tags[]`, `m[].key`, `answers.text[]`), with the same column paths as
+  Arrow. Rows come from the repetition levels, including rows that span
+  pages.
+- **Nothing is skipped silently:** strings in Arrow unions, run-end-encoded
+  arrays and list views are reported on stderr
+  (`column u not searched (strings in a union)`), and the exit status is 2.
+- **`-f FILE`: many terms at once** (one per line, `-` for stdin). From 8
+  terms on, an Aho-Corasick automaton searches them in one pass: 10,000
+  terms over the 2.3 GB Arrow file in 397 ms, 100,000 in 738 ms
+  (`bench/terms.sh`). Works with `-i` and `-w`; with many terms, `-w`
+  no longer becomes a regex.
 - **Optional PCRE2 regex engine:** `zig build -Dpcre2` runs `-E` with
   PCRE2 and its JIT (`third_party/pcre2`, a git submodule, BSD) instead of
   fds's Pike VM. Same matches, behind the same SIMD prefilter; 1.2–4×

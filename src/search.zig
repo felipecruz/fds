@@ -14,6 +14,8 @@ const builtin = @import("builtin");
 const Io = std.Io;
 const Map = @import("map.zig").Map;
 const match = @import("match.zig");
+const multi = @import("multi.zig");
+const pattern = @import("pattern.zig");
 const parquet = @import("parquet.zig");
 const regex = @import("re.zig");
 const search_arrow = @import("search_arrow.zig");
@@ -25,8 +27,11 @@ pub const Options = struct {
     /// A literal, or the source of `regex`. Not empty.
     term: []const u8,
     /// With no regex: several literals, any of which may match (`-e`). If
-    /// empty, just `term`.
+    /// empty, just `term`. From `pattern.many` of them on, they are
+    /// searched together, with an Aho-Corasick automaton (multi.zig).
     terms: []const []const u8 = &.{},
+    /// With `terms`: each must match as a whole word (`-w`, many terms).
+    word: bool = false,
     /// Worker threads.
     jobs: usize,
     /// ASCII case-insensitive matching.
@@ -41,6 +46,8 @@ pub const Options = struct {
     /// About how many bytes of strings one piece of an Arrow column holds
     /// (see search_arrow.zig). Tests make it small to cut columns finely.
     piece_bytes: usize = 8 << 20,
+    /// The automaton for `terms`, built by `run`.
+    set: ?*const multi.Set = null,
 };
 
 /// The default thread count: the number of performance cores
@@ -116,7 +123,15 @@ pub fn isDataFile(name: []const u8) bool {
 
 /// Searches every data file under `opts.root_path`, or that one file if it
 /// is a file (whatever its name).
-pub fn run(gpa: std.mem.Allocator, opts: Options, output: Output) !Summary {
+pub fn run(gpa: std.mem.Allocator, options: Options, output: Output) !Summary {
+    var opts = options;
+    var set: ?multi.Set = null;
+    defer if (set) |*st| st.deinit();
+    if (opts.regex == null and (opts.terms.len >= pattern.many or opts.word)) {
+        set = try .init(gpa, if (opts.terms.len > 0) opts.terms else (&opts.term)[0..1], .{ .ignore_case = opts.ignore_case, .word = opts.word });
+        opts.set = &set.?;
+    }
+
     // The calling thread only starts the root task and then waits in
     // `group.await`, so all searching happens on the `jobs` pool threads.
     var threaded: Io.Threaded = .init(gpa, .{ .async_limit = .limited(opts.jobs) });
@@ -323,6 +338,15 @@ pub const Searcher = struct {
         return if (s.output == .print) s.output.print.mode else .matches;
     }
 
+    /// Reports strings in a file that fds can't search, on stderr. The
+    /// search is not complete, so it counts as an error for the exit
+    /// status, as an unreadable file does.
+    pub fn notSearched(s: *Searcher, path: []const u8, column: []const u8, why: []const u8) void {
+        s.errors.store(true, .monotonic);
+        if (builtin.is_test) return;
+        std.debug.print("fds: {s}: column {s} not searched ({s})\n", .{ path, column, why });
+    }
+
     /// Reports a file that can't be searched, on stderr.
     fn warn(s: *Searcher, path: []const u8, format: ?Format, err: anyerror) void {
         s.errors.store(true, .monotonic);
@@ -457,6 +481,7 @@ pub const Matcher = struct {
     /// array given as offsets into back-to-back data, in order.
     pub fn findValues(m: Matcher, comptime O: type, off: []align(1) const O, data: []const u8, sink: anytype) !void {
         if (m.opts.regex) |re| return regex.findValues(re, m.vm.?, O, off, data, sink);
+        if (m.opts.set) |set| return set.findValues(O, off, data, sink);
         const terms = m.literals();
         if (terms.len == 1) {
             if (m.opts.ignore_case) return match.findValues(.insensitive, O, off, data, terms[0], sink);
@@ -488,6 +513,7 @@ pub const Matcher = struct {
     /// Does one value match?
     pub fn matches(m: Matcher, value: []const u8) bool {
         if (m.opts.regex) |re| return regex.matches(re, m.vm.?, value);
+        if (m.opts.set) |set| return set.matches(value);
         for (m.literals()) |t| {
             if (if (m.opts.ignore_case) match.contains(.insensitive, value, t) else match.contains(.sensitive, value, t)) return true;
         }
@@ -498,6 +524,7 @@ pub const Matcher = struct {
     /// highlighting.
     pub fn span(m: Matcher, value: []const u8, from: usize) ?[2]usize {
         if (m.opts.regex) |re| return regex.span(m.vm.?, re, value, from);
+        if (m.opts.set) |set| return set.span(value, from);
         // The earliest occurrence of any literal; the longest one there.
         var best: ?[2]usize = null;
         for (m.literals()) |t| {
@@ -515,6 +542,7 @@ pub const Matcher = struct {
             if (re.literal.len == 0) return true;
             return if (re.ignore_case) match.contains(.insensitive, bytes, re.literal) else match.contains(.sensitive, bytes, re.literal);
         }
+        if (m.opts.set) |set| return set.mayMatch(bytes);
         return m.matches(bytes); // any literal anywhere in the bytes
     }
 };
@@ -651,12 +679,9 @@ test "search the test files" {
     for (polars_hits) |h| {
         try expected.append(testing.allocator, try std.fmt.allocPrint(testing.allocator, "testdata/tree/polars.arrow:{s}", .{h}));
     }
-    // Parquet: the same table, minus lists and maps (not searched yet).
+    // Parquet: the same table, lists and maps included.
     for ([_][]const u8{ "snappy", "v2_delta", "plain_gzip", "lz4" }) |file| {
-        for (table_hits) |h| {
-            if (std.mem.indexOf(u8, h, "[]") != null) continue;
-            try expected.append(testing.allocator, try std.fmt.allocPrint(testing.allocator, "testdata/tree/parquet/{s}.parquet:{s}", .{ file, h }));
-        }
+        for (table_hits) |h| try expected.append(testing.allocator, try std.fmt.allocPrint(testing.allocator, "testdata/tree/parquet/{s}.parquet:{s}", .{ file, h }));
     }
     for ([_][]const u8{ "plain.arrow", "sub/lz4.feather", "sub/zstd.arrow" }) |file| {
         for (table_hits) |h| try expected.append(testing.allocator, try std.fmt.allocPrint(testing.allocator, "testdata/tree/{s}:{s}", .{ file, h }));
@@ -693,6 +718,32 @@ test "search one file: columns, case, regex" {
         file ++ ":user.name:4:needles",
         file ++ ":view:3:needle",
     });
+}
+
+test "many terms: the automaton" {
+    // From pattern.many terms on, run() searches them with multi.zig.
+    const terms = [_][]const u8{ "zz1", "zz2", "zz3", "zz4", "zz5", "zz6", "HERE", "eedles", "needle!" };
+    try testing.expect(terms.len >= pattern.many);
+    for ([_][]const u8{ "testdata/tree/plain.arrow", "testdata/tree/parquet/snappy.parquet" }) |file| {
+        var buf: [2][160]u8 = undefined;
+        const want = [_][]const u8{
+            try std.fmt.bufPrint(&buf[0], "{s}:name:4:a needle here", .{file}),
+            try std.fmt.bufPrint(&buf[1], "{s}:user.name:4:needles", .{file}),
+        };
+        try expectHits(.{ .root_path = file, .term = terms[0], .terms = &terms, .jobs = 2, .ignore_case = true, .columns = &.{ "name", "user", "tags" } }, &want);
+        // Case matters without -i; -w needs whole words.
+        try expectHits(.{ .root_path = file, .term = terms[0], .terms = &terms, .jobs = 2, .columns = &.{ "name", "user", "tags" } }, want[1..]);
+        const words = [_][]const u8{ "zz1", "zz2", "zz3", "zz4", "zz5", "zz6", "needle", "red", "edle" };
+        var wbuf: [6][160]u8 = undefined;
+        try expectHits(.{ .root_path = file, .term = words[0], .terms = &words, .word = true, .jobs = 2, .columns = &.{ "name", "cat" } }, &.{
+            try std.fmt.bufPrint(&wbuf[0], "{s}:cat:0:red", .{file}),
+            try std.fmt.bufPrint(&wbuf[1], "{s}:cat:1:needle", .{file}),
+            try std.fmt.bufPrint(&wbuf[2], "{s}:cat:2:red", .{file}),
+            try std.fmt.bufPrint(&wbuf[3], "{s}:cat:4:needle", .{file}),
+            try std.fmt.bufPrint(&wbuf[4], "{s}:name:0:needle", .{file}),
+            try std.fmt.bufPrint(&wbuf[5], "{s}:name:4:a needle here", .{file}),
+        });
+    }
 }
 
 // Runs a search printing into a file, and returns what it printed.
@@ -734,9 +785,19 @@ test "output modes: -l, --count, -m, --json, colors; the summary" {
     try testing.expect(r.summary.matched and !r.summary.errors);
     testing.allocator.free(r.text);
 
-    // Nothing found: not matched. A malformed file: an error.
-    r = try printed(.{ .root_path = file, .term = "zqxjv", .jobs = 1 }, anyfile);
+    // Nothing found: not matched. A malformed file, or strings fds can't
+    // search (the union `u`): an error.
+    r = try printed(.{ .root_path = file, .term = "zqxjv", .jobs = 1, .columns = &.{ "name", "tags", "m" } }, anyfile);
     try testing.expect(!r.summary.matched and !r.summary.errors);
+    testing.allocator.free(r.text);
+    r = try printed(.{ .root_path = file, .term = "zqxjv", .jobs = 1 }, anyfile);
+    try testing.expect(!r.summary.matched and r.summary.errors);
+    testing.allocator.free(r.text);
+    r = try printed(.{ .root_path = file, .term = "zqxjv", .jobs = 1, .columns = &.{"u"} }, anyfile);
+    try testing.expect(r.summary.errors);
+    testing.allocator.free(r.text);
+    r = try printed(.{ .root_path = "testdata/tree/parquet/snappy.parquet", .term = "zqxjv", .jobs = 1 }, anyfile);
+    try testing.expect(!r.summary.matched and !r.summary.errors); // lists and maps are searched
     testing.allocator.free(r.text);
     r = try printed(.{ .root_path = "testdata/tree", .term = "needle", .jobs = 4 }, .{ .file = undefined, .mode = .files_with_matches });
     try testing.expect(r.summary.matched and r.summary.errors); // truncated.arrow

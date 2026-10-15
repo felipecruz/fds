@@ -30,7 +30,7 @@ def table():
             # Row 4; with -i, 1 too. "nee" + "dle" (rows 2, 3) is no match.
             "note": pa.array(["", "NEEDLE", "nee", "dle", "needle\nline", None], pa.large_string()),
             "blob": pa.array([b"needle"] * 6, pa.binary()),  # not a string: not searched
-            "u": union,  # strings inside unions are not searched
+            "u": union,  # strings inside unions are reported, not searched
             # Rows 1 (stored out of line) and 3 (inline: up to 12 bytes).
             "view": pa.array(["short", "a long string with needle inside", None, "needle", "", "n"], pa.string_view()),
             # Rows 0 and 3 (twice in row 3, reported once); "ne" + "edle" is no match.
@@ -94,9 +94,8 @@ def main():
     }).write_ipc(os.path.join(HERE, "tree", "polars.arrow"))
 
     # Parquet: the same table (without the union, which Parquet can't
-    # hold), written four ways. Strings in lists and maps (tags, m, pair)
-    # are not searched in Parquet yet; the rest matches as in the Arrow
-    # files. Plus a file with no rows.
+    # hold), written four ways; it matches as in the Arrow files. Plus a
+    # file with no rows.
     import pyarrow.parquet as pq
     pt = t.drop_columns(["u"])
     pdir = os.path.join(HERE, "tree", "parquet")

@@ -26,7 +26,8 @@ Parquet readers, to the SIMD loop that finds a term in a string column.
 | `src/regex.zig` | `-E`: regex parser, compiler and Pike VM, behind the SIMD search as a prefilter |
 | `src/pcre2.zig` | `-E` through PCRE2 (`third_party/pcre2`, only with `-Dpcre2`), same interface as `regex.zig` |
 | `src/re.zig` | Picks the `-E` engine at build time: `regex.zig` or `pcre2.zig` |
-| `src/pattern.zig` | The command line's terms (`-e`, `-w`, `-S`, `-E`) into literals or one regex |
+| `src/multi.zig` | Many literals at once (`-f`): an Aho-Corasick automaton |
+| `src/pattern.zig` | The command line's terms (`-e`, `-f`, `-w`, `-S`, `-E`) into literals or one regex |
 | `src/c_api.zig` | C ABI (`include/fds.h`): `fds_search` with a callback, over `search.run` |
 | `src/bench_match.zig` | Matcher microbenchmark (`zig build bench-match`) |
 
@@ -199,7 +200,12 @@ A *target* is one string array: a field whose type is `utf8`, `large_utf8`
 or `utf8_view`, or a dictionary-encoded field whose values have one of those
 types. It can sit at any depth under structs, lists, large lists,
 fixed-size lists and maps. Unions, run-end-encoded arrays and list views
-are not entered, though `Batch.place` still steps over them correctly.
+are not entered, though `Batch.place` still steps over them correctly:
+their entries don't map to their children's one to one and in order, as
+`Level.parent` needs. If strings sit under one, `findTargets` lists it,
+and `plan` reports it through `Searcher.notSearched`: a line on stderr,
+and the error flag, so the exit status is 2. A search that left strings
+out never looks like a clean "no match".
 
 Each target records its column path and the nested fields above it:
 
@@ -247,10 +253,21 @@ the leaves in chunk order, each with its path, its maximum definition
 level (one per optional or repeated field on the way) and its maximum
 repetition level (one per repeated field). A leaf is searched if it is a
 `BYTE_ARRAY` annotated as text (logical type STRING, ENUM or JSON, or the
-converted types UTF8, ENUM, JSON) and nothing above it is repeated. Then
-every value is one row: top-level columns and struct fields (`user.name`).
-Leaves under lists or maps have repetition levels, and values no longer
-map one-to-one to rows; they are not searched yet.
+converted types UTF8, ENUM, JSON), wherever it sits.
+
+Paths are named as in Arrow, so both formats print the same columns: the
+repeated group under a `LIST` (or `MAP`) annotation is `name[]`, and a
+`LIST`'s single element below it is the list's values, whatever the writer
+called the two (`list.element`, `bag.array`). So `tags[]`, `m[].key`,
+`answers.text[]`. A repeated field outside a `LIST` or `MAP` is `name[]`
+too.
+
+**Rows of a repeated column.** Under a list, a row holds any number of
+values, and the levels say which: an entry (a value or a null) whose
+repetition level is 0 starts a row, any other continues the last one,
+which may have started on an earlier page (`rowsOf`). Present values (the
+maximum definition level) are mapped to their row, and the sink gets them
+in row order; `Piece.record` reports a row once.
 
 **Pieces.** One per searched column per row group, in output order (row
 group, then column). Each chunk is its own byte range of the file, so a
@@ -261,14 +278,17 @@ finished piece releases it right away.
    (PLAIN: a 4-byte length, then the bytes) into offsets and data, and
    searched once, giving a bitset of matching keys.
 2. **Data pages**, v1 or v2. In v1 the whole page is compressed, and holds
-   the definition levels (a 4-byte length, then the run-length/bit-packing
-   hybrid) then the values. In v2 the levels come first, uncompressed, with
-   their lengths in the header, and only the values are compressed.
+   the repetition levels and the definition levels (each a 4-byte length,
+   then the run-length/bit-packing hybrid), then the values. In v2 the
+   levels come first, uncompressed, with their lengths in the header, and
+   only the values are compressed.
 
 **Skipping pages.** Two checks run before any real work:
 - A **dictionary-encoded** page whose dictionary had no matching entry
   can't match. It is skipped before it is even decompressed. This is the
-  common case for a rare term in a low-cardinality column.
+  common case for a rare term in a low-cardinality column. In a repeated
+  column its rows must still be counted, from its repetition levels: free
+  in a v2 page, a decompression in a v1 page.
 - A **PLAIN** page is decompressed, but before its values are decoded,
   `Matcher.mayMatch` scans its raw bytes for the term (or a regex's required
   literal) with the SIMD loop. If the term is nowhere, no value can hold it.
@@ -501,6 +521,32 @@ one pass per literal over a column, marking matching values in a bitset,
 then hands them to the sink once each, in order. A regex alternation
 would have no required literal, so the VM would run on every value
 (1.16 s against 0.27 s for two terms on the benchmark).
+
+**Many literals** (`pattern.many`, 8, or more: `-f`, or many `-e`) are one
+pass of an Aho-Corasick automaton (`multi.zig`), which `run` builds once
+and every thread shares. On the benchmark, 8 SIMD passes take as long as
+one automaton pass (~340 ms), and 10,000 terms take ~400 ms.
+
+- **Byte classes.** Bytes that occur in some term get a class each (with
+  `-i`, a letter and its upper case share one); all other bytes are class
+  0. Rows are as wide as the number of classes, not 256.
+- **Dense rows first.** States are numbered breadth first. Shallow states,
+  where a scan spends nearly all its time, get a full row of transitions
+  (one load per byte), up to a 64 MB budget; deeper ones keep their trie
+  edges and follow failure links, which always lead to a shallower state.
+  When every state fits (a few tens of thousands of terms), transitions
+  are stored as row offsets, saving a multiply per byte.
+- **One run per column.** As in the SIMD loop, a column's bytes are
+  scanned back to back, not value by value (values are often a few dozen
+  bytes). A transition into a state where a term ends carries a flag bit;
+  only then do the offsets say which value that is (`match.rowOf`), and
+  only a term that lies inside it counts. A matched value is reported
+  once, and the scan restarts at the next.
+- **`-w`** keeps the terms literal: at a match, every term ending there
+  (through `dict` links, the nearest state on the failure chain where a
+  term ends) is checked for word boundaries inside the value.
+  `mayMatch` (Parquet's page skip) ignores them: around a value's bytes in
+  a raw page are lengths, not its neighbors.
 
 For the C API, the sink stores the value's bytes and position instead,
 and `report` turns each one into a `search.Hit`. `c_api.zig` copies a hit

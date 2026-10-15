@@ -72,10 +72,8 @@ def is_string(t):
     return pa.types.is_string(t) or pa.types.is_large_string(t) or pa.types.is_string_view(t)
 
 
-def hits(name, t, v, term, fold, lists=True):
-    """Column paths under `name` whose strings in value `v` contain term.
-    With lists=False, strings inside lists and maps don't count (fds does
-    not search them in Parquet files yet)."""
+def hits(name, t, v, term, fold):
+    """Column paths under `name` whose strings in value `v` contain term."""
     if v is None:
         return set()
     if is_string(t):
@@ -84,9 +82,7 @@ def hits(name, t, v, term, fold, lists=True):
     out = set()
     if pa.types.is_struct(t):
         for f in t:
-            out |= hits(f"{name}.{f.name}", f.type, v[f.name], term, fold, lists)
-    elif not lists:
-        pass
+            out |= hits(f"{name}.{f.name}", f.type, v[f.name], term, fold)
     elif pa.types.is_map(t):
         for k, item in v:
             out |= hits(f"{name}[].key", pa.string(), k, term, fold)
@@ -167,7 +163,11 @@ def main():
             try:
                 settings = write_parquet(r, table, path)
                 table = pq.read_table(path)  # what the file holds
-            except pa.ArrowException:
+                # pyarrow sometimes drops rows reading its own nested files
+                # back (DuckDB and polars read them all): no reference then.
+                if table.num_rows != pq.ParquetFile(path).metadata.num_rows:
+                    raise pa.ArrowException("read back short")
+            except (pa.ArrowException, OSError):
                 # pyarrow fails to write some nested tables in tiny row
                 # groups, or to read them back: nothing to compare.
                 skipped += 1
@@ -183,15 +183,25 @@ def main():
                 w.write_table(table, max_chunksize=chunk)
             settings = f"chunk {chunk}, {compression}"
 
-        term = "".join(r.choice("abAB") for _ in range(r.randint(1, 3)))
+        # One term, or (with -f) enough for the Aho-Corasick search.
+        terms = ["".join(r.choice("abAB\n") for _ in range(r.randint(1, 3))) for _ in range(r.choice([1, 1, 8, 12]))]
+        terms = [t for t in terms if t.strip("\n")] or ["a"]
         fold = r.random() < 0.3
         expected = set()
         rows = table.to_pylist()
         for row_index, row in enumerate(rows):
             for f in table.schema:
-                for col in hits(f.name, f.type, row[f.name], ascii_lower(term) if fold else term, fold, lists=not use_parquet):
-                    expected.add(f"{path}:{col}:{row_index}")
-        args = [fds] + (["-i"] if fold else []) + [path, term]
+                for term in terms:
+                    for col in hits(f.name, f.type, row[f.name], ascii_lower(term) if fold else term, fold):
+                        expected.add(f"{path}:{col}:{row_index}")
+        if len(terms) == 1:
+            args = [fds] + (["-i"] if fold else []) + [path, terms[0]]
+        else:
+            # Newlines can't be in a -f file's terms: those go in as -e.
+            terms_file = path + ".terms"
+            with open(terms_file, "w") as tf:
+                tf.write("".join(t + "\n" for t in terms if "\n" not in t))
+            args = [fds] + (["-i"] if fold else []) + ["-f", terms_file] + sum((["-e", t] for t in terms if "\n" in t), []) + [path]
         out = subprocess.run(args, capture_output=True, text=True)
         got = set(out.stdout.splitlines())
         total += len(expected)

@@ -153,18 +153,24 @@ Every string value the schema has. In **Arrow** files:
 - strings nested in structs, lists, large lists, fixed-size lists and maps,
   at any depth.
 
-Not searched: binary columns, and strings inside unions, run-end-encoded
-or list-view arrays.
-
 In **Parquet** files: `BYTE_ARRAY` columns annotated as text (`STRING`,
-`ENUM` or `JSON`), at the top level or inside structs (`user.name`).
-Not yet: strings inside lists and maps.
+`ENUM` or `JSON`), at the top level, inside structs (`user.name`), and
+inside lists and maps (`tags[]`, `m[].key`, `m[].value`), at any depth.
+Column paths are the same in both formats.
+
+**Nothing is skipped silently.** Binary columns are not text and are not
+searched. Strings fds can't search, inside Arrow unions, run-end-encoded
+arrays or list views, are reported on stderr
+(`fds: <path>: column u not searched (strings in a union)`), and the exit
+status is 2, as for an unreadable file: a "no match" is never an
+incomplete search. `-c` leaves out the columns it doesn't select.
 
 ## Usage
 
 ```
 fds [options] <path> <term>
 fds [options] -e <term> [-e <term>]... <path>
+fds [options] -f <file> <path>
 
 matching:
   -i, --ignore-case    ASCII case-insensitive
@@ -172,6 +178,7 @@ matching:
   -E, --regex          terms are regexes: . [a-z] [^0-9] \d \w \s \b ^ $ * + ? {n,m} | ( ) \n
   -w, --word           whole words only
   -e, --regexp TERM    a term; repeat to match any of several
+  -f, --file FILE      terms, one per line (- for stdin); thousands are fine
   -c, --column NAME    search only this column: a top-level name, or a path
                        like user.name or tags[]; repeatable
 output:
@@ -228,8 +235,33 @@ objects are `{"path"}`; with `--count`, `{"path","column","count"}`.
 **Speed of the modes**, `checkout` in the 2.3 GB Arrow file (4.4 M
 matches): printing them all 150 ms, `--count` 68 ms, `-m 1` 21 ms, `-l`
 5 ms (it stops at the first match). `-e a -e b` searches each literal with
-the SIMD loop (272 ms for two); `-w` and `-E` alternations run the regex
-engine on candidate values.
+the SIMD loop (272 ms for two); `-E` alternations, and `-w` with a few
+terms, run the regex engine on candidate values.
+
+### Many terms (`-f`)
+
+`-f terms.txt` reads the terms from a file, one per line (empty lines are
+ignored; `-f -` reads stdin). From 8 terms on, fds searches them all in
+one pass with an Aho-Corasick automaton, so the time hardly depends on how
+many there are. That is the shape of scanning jobs: does any of these
+10,000 benchmark questions appear in my training data, which rows hold
+one of these customer IDs or leaked keys? `-i` and `-w` work as with one
+term.
+
+`--count -f` on the same 2.3 GB Arrow file and 740 MB Parquet file:
+
+| Terms | Arrow (2.3 GB) | Parquet (740 MB) |
+|---:|---:|---:|
+| 8 | 339 ms | 648 ms |
+| 100 | 337 ms | 570 ms |
+| 1,000 | 347 ms | 578 ms |
+| 10,000 | 397 ms | 643 ms |
+| 100,000 | 738 ms | 1,035 ms |
+
+The term files are random strings, 8 to 24 bytes, with one in a hundred a
+host name that occurs in the data. Up to 7 terms, one SIMD pass each is
+faster (about 40 ms per term on the Arrow file). The script is
+`bench/terms.sh`.
 
 ## Building
 
@@ -313,9 +345,12 @@ produce.
 - **ASCII semantics.** `-i`, `\w` and `\b` are ASCII-only.
 - **String views** are searched one value at a time, because their bytes
   are not stored back to back. That is slower than `utf8` columns.
-- **Parquet:** strings inside lists and maps are not searched yet. A
-  column chunk is searched by one thread, so a file with fewer chunks than
-  threads doesn't use them all.
+- **Arrow:** strings inside unions, run-end-encoded arrays and list views
+  are reported, not searched (see [What gets searched](#what-gets-searched)).
+- **Parquet:** a column chunk is searched by one thread, so a file with
+  fewer chunks than threads doesn't use them all. In a list column, every
+  page is decompressed to count its rows, even when its dictionary rules
+  out a match.
 - **Parquet pages are capped at 16 M values**, far above what writers
   produce, so that a corrupted header can't make fds allocate without
   bound. A larger page is reported as unsupported.
