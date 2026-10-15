@@ -1,0 +1,12 @@
+// Code blocks: lines as close together as in a terminal. The theme sizes the
+// <code> down but leaves the <pre> at the body's size and line height, which
+// spaces the lines apart.
+div.highlighter-rouge pre.highlight {
+  font-size: 0.8125rem;
+  line-height: 1.45;
+}
+
+div.highlighter-rouge pre.highlight code {
+  font-size: inherit;
+  line-height: inherit;
+}

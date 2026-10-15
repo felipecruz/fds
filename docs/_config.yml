@@ -1,0 +1,36 @@
+# GitHub Pages: .github/workflows/pages.yml builds this folder into the docs
+# site with the Just the Docs theme. Page titles and order live here, not in
+# front matter, so the pages also read cleanly on GitHub and in `fds help`.
+title: fds
+description: Search the string values of Arrow and Parquet files, grep-style.
+remote_theme: just-the-docs/just-the-docs@v0.12.0
+plugins:
+  - jekyll-remote-theme
+  - jekyll-relative-links
+relative_links:
+  enabled: true
+search_enabled: true
+heading_anchors: true
+aux_links:
+  fds on GitHub: https://github.com/felipecruz/fds
+aux_links_new_tab: true
+back_to_top: true
+footer_content: Every example on these pages is run and checked in CI (docs/examples.py --check).
+exclude:
+  - fds.1
+  - fds.1.md
+  - help.zig
+  - examples.py
+  - man.sh
+  - demo.sh
+  - demo.tape
+defaults:
+  - { scope: { path: README.md }, values: { title: Home, nav_order: 1, permalink: / } }
+  - { scope: { path: search.md }, values: { title: Searching, nav_order: 2 } }
+  - { scope: { path: matching.md }, values: { title: Matching, nav_order: 3 } }
+  - { scope: { path: many-terms.md }, values: { title: Many terms, nav_order: 4 } }
+  - { scope: { path: columns.md }, values: { title: Columns, nav_order: 5 } }
+  - { scope: { path: output.md }, values: { title: Output, nav_order: 6 } }
+  - { scope: { path: scripting.md }, values: { title: Scripting, nav_order: 7 } }
+  - { scope: { path: formats.md }, values: { title: Formats, nav_order: 8 } }
+  - { scope: { path: man.md }, values: { title: man fds, nav_order: 9 } }
