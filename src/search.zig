@@ -152,7 +152,15 @@ pub fn run(gpa: std.mem.Allocator, options: Options, output: Output) !Summary {
         error.NotDir => try searcher.searchFile(.cwd(), opts.root_path, opts.root_path),
         else => return err,
     }
-    if (output == .print) try file_writer.interface.flush();
+    if (output == .print) file_writer.interface.flush() catch {
+        searcher.write_failed.store(true, .monotonic);
+    };
+    // The output closed early (`fds ... | head`): quietly done, as grep.
+    // Any other write error (a full disk) is the search's error.
+    if (searcher.write_failed.load(.monotonic)) {
+        const err = file_writer.err orelse error.WriteFailed;
+        if (err != error.BrokenPipe) return err;
+    }
     return .{ .matched = searcher.matched.load(.monotonic), .errors = searcher.errors.load(.monotonic) };
 }
 
@@ -166,6 +174,7 @@ pub const Searcher = struct {
     stopped: std.atomic.Value(bool) = .init(false), // a callback returned false
     matched: std.atomic.Value(bool) = .init(false),
     errors: std.atomic.Value(bool) = .init(false),
+    write_failed: std.atomic.Value(bool) = .init(false), // the output; stops the search
 
     /// Per-directory-task state, reused for every file in the directory.
     pub const Local = struct {
@@ -197,6 +206,13 @@ pub const Searcher = struct {
         const format: Format = if (parquet.isParquet(map.bytes)) .parquet else .arrow;
         s.searchMap(path, map, format) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
+            // Writing the output failed: no use searching on (see `run`).
+            // Only matches are written, so something matched.
+            error.WriteFailed => {
+                s.matched.store(true, .monotonic);
+                s.write_failed.store(true, .monotonic);
+                s.stopped.store(true, .monotonic);
+            },
             else => s.warn(path, format, err),
         };
     }

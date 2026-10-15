@@ -7,6 +7,7 @@ const version = "0.0.7";
 //   zig-out/debug/fds     (Debug: safety checks, debug info)
 //   zig-out/release/fds   (ReleaseFast: production)
 //   zig-out/lib/libfds.a  (ReleaseFast C library) + zig-out/include/fds.h
+//   zig-out/share/man/man1/fds.1  (the man page, from docs/)
 //
 // Third-party code lives in third_party/, as git submodules (clone with
 // --recursive, or run `git submodule update --init`):
@@ -38,6 +39,9 @@ pub fn build(b: *std.Build) void {
         .{ .dir = "release", .optimize = .ReleaseFast, .strip = true },
     };
 
+    // docs/: the pages `fds help` prints, built into the binary.
+    const docs = b.createModule(.{ .root_source_file = b.path("docs/help.zig") });
+
     for (variants) |v| {
         const exe = b.addExecutable(.{
             .name = "fds",
@@ -50,6 +54,7 @@ pub fn build(b: *std.Build) void {
             }),
         });
         exe.root_module.addOptions("build_options", options);
+        exe.root_module.addImport("docs", docs);
         exe.root_module.linkLibrary(zstd);
         const install = b.addInstallArtifact(exe, .{
             .dest_dir = .{ .override = .{ .custom = v.dir } },
@@ -77,6 +82,10 @@ pub fn build(b: *std.Build) void {
     lib.bundle_compiler_rt = true;
     lib.installHeader(b.path("include/fds.h"), "fds.h");
     b.installArtifact(lib);
+
+    // The man page, written from docs/fds.1.md by docs/man.sh. With
+    // `--prefix ~/.local`, `man fds` finds it.
+    b.installFile("docs/fds.1", "share/man/man1/fds.1");
 
     // `zig build c-example -- <path> <term>`: examples/count.c against libfds.
     const example = b.addExecutable(.{
@@ -115,6 +124,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     tests.root_module.addOptions("build_options", options);
+    tests.root_module.addImport("docs", docs);
     tests.root_module.linkLibrary(zstd);
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);

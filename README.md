@@ -3,6 +3,8 @@
 **Fast data search: an experimental project to bring fast string search
 to the file formats of data science and machine learning.**
 
+![fds searching 20 million rows of Arrow and Parquet logs](docs/demo.gif)
+
 Data lives in columnar files, not text files, and finding a string in them
 usually means loading them into a dataframe or a database first. fds
 searches the files directly, grep-style: point it at a directory and a
@@ -54,8 +56,9 @@ $ fds --json -c note plain.arrow needle
 {"path":"plain.arrow","column":"note","row":4,"value":"needle\nline"}
 ```
 
-Many more, each with its real output on the test files in this
-repository: **[EXAMPLES.md](EXAMPLES.md)**.
+**[The documentation](docs/README.md)** has every option, each example
+with its real output (CI checks them), and the same pages in the terminal
+(`fds help`) and as a man page (`man fds`).
 
 ## Results
 
@@ -416,7 +419,7 @@ CI (`.github/workflows/ci.yml`) runs all of it on Linux and macOS.
 
 ## More
 
-- [EXAMPLES.md](EXAMPLES.md): every option, with real output.
+- [docs/](docs/README.md): the documentation, topic by topic.
 - [ARCHITECTURE.md](ARCHITECTURE.md): how the code works, from the Arrow
   reader to the SIMD loop.
 - [CHANGELOG.md](CHANGELOG.md).

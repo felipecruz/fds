@@ -27,6 +27,12 @@ jobs:
       - name: Search the test files
         # Exit 2: testdata/tree has a truncated file, reported as an error.
         run: zig-out/release/fds testdata/tree needle || test $? -eq 2
+      - name: The docs' examples print what the pages show
+        run: |
+          zig build -Dpcre2 -p zig-out/pcre2
+          python3 docs/examples.py --check
+      - name: fds help
+        run: zig-out/release/fds help && zig-out/release/fds help matching > /dev/null
       - name: Static build (musl)
         if: runner.os == 'Linux'
         run: zig build -Dtarget=x86_64-linux-musl && file zig-out/release/fds | grep -q 'statically linked'

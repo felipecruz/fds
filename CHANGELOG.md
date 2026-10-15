@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Documentation in `docs/`**, one page per topic. Every example shows
+  its real output, and CI fails if one changes (`docs/examples.py
+  --check`). The same pages are built into the binary (`fds help
+  <topic>`), and a man page is generated from `docs/fds.1.md` and
+  installed by `zig build` (`man fds`).
+- Writing into a closed pipe (`fds ... | head`) stops the search quietly,
+  as grep does, instead of printing `WriteFailed`.
 - **Parquet: strings in lists and maps are searched**, at any depth
   (`tags[]`, `m[].key`, `answers.text[]`), with the same column paths as
   Arrow. Rows come from the repetition levels, including rows that span

@@ -1,6 +1,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const search = @import("search.zig");
+const help = @import("help.zig");
 const pattern = @import("pattern.zig");
 const re_engine = @import("re.zig");
 const Regex = re_engine.Regex;
@@ -41,6 +42,23 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
 
     const args = try init.minimal.args.toSlice(arena);
+    // `fds help [topic]`. (A directory named help: `fds ./help <term>`.)
+    if (args.len >= 2 and args.len <= 3 and std.mem.eql(u8, args[1], "help")) {
+        const color = (std.Io.File.stdout().isTty(init.io) catch false) and init.environ_map.get("NO_COLOR") == null;
+        var buf: [4096]u8 = undefined;
+        var fw = std.Io.File.stdout().writer(init.io, &buf);
+        const w = &fw.interface;
+        if (args.len == 2) {
+            try help.writeIndex(w, color);
+        } else if (help.find(args[2])) |t| {
+            try help.render(w, t.text, color);
+        } else {
+            std.debug.print("fds: no help topic {s}; `fds help` lists them\n", .{args[2]});
+            std.process.exit(2);
+        }
+        try w.flush();
+        return;
+    }
     var jobs: usize = 0; // 0: automatic
     var print: search.Print = .{ .file = .stdout() };
     var color: enum { auto, always, never } = .auto;
@@ -218,6 +236,9 @@ fn usage(status: u8) noreturn {
         \\                       performance-core count on Apple silicon, else all CPUs)
         \\  -V, --version        print the version
         \\
+        \\fds help [topic]: the documentation, by topic (search, matching, many-terms,
+        \\columns, output, scripting, formats). Also: man fds.
+        \\
         \\Exit status: 0 if something matched, 1 if nothing did, 2 on an error.
         \\
     , .{search.autoJobs()});
@@ -228,6 +249,7 @@ test {
     _ = @import("arrow.zig");
     _ = @import("c_api.zig");
     _ = @import("flatbuf.zig");
+    _ = @import("help.zig");
     _ = @import("lz4.zig");
     _ = @import("map.zig");
     _ = @import("codecs.zig");

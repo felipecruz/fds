@@ -28,6 +28,7 @@ Parquet readers, to the SIMD loop that finds a term in a string column.
 | `src/re.zig` | Picks the `-E` engine at build time: `regex.zig` or `pcre2.zig` |
 | `src/multi.zig` | Many literals at once (`-f`): an Aho-Corasick automaton |
 | `src/pattern.zig` | The command line's terms (`-e`, `-f`, `-w`, `-S`, `-E`) into literals or one regex |
+| `src/help.zig` | `fds help [topic]`: the pages of `docs/` (embedded via `docs/help.zig`), rendered for a terminal |
 | `src/c_api.zig` | C ABI (`include/fds.h`): `fds_search` with a callback, over `search.run` |
 | `src/bench_match.zig` | Matcher microbenchmark (`zig build bench-match`) |
 
