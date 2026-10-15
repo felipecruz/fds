@@ -40,7 +40,8 @@ parquet/snappy.parquet:pair[0]:5
   bytes.
 
 `--content` adds the value. Newlines in it are printed as `\n`, so one
-match is always one line.
+match is always one line (and other control characters as `\xNN`; see
+[Output](output.md)).
 
 ```console
 $ fds --content parquet/snappy.parquet 'a needle'

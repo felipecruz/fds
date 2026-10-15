@@ -95,20 +95,19 @@ pub const Reader = struct {
             .binary => _ = try r.binary(.binary),
             .list, .set => {
                 const l = try r.list();
-                for (0..l.len) |_| {
-                    // In lists, bools take a byte each.
-                    if (l.elem == .bool_true or l.elem == .bool_false) _ = try r.byte() else try r.skipDepth(l.elem, depth + 1);
-                }
+                for (0..l.len) |_| try r.skipElement(l.elem, depth + 1);
             },
             .map => {
                 const len = std.math.cast(usize, try r.varint()) orelse return error.Malformed;
                 if (len == 0) return;
                 const kv = try r.byte();
+                // Every entry takes at least two bytes: a longer map can't be real.
+                if (len > (r.buf.len - r.pos) / 2) return error.Malformed;
                 const k: Type = @enumFromInt(@as(u4, @truncate(kv >> 4)));
                 const v: Type = @enumFromInt(@as(u4, @truncate(kv)));
                 for (0..len) |_| {
-                    try r.skipDepth(k, depth + 1);
-                    try r.skipDepth(v, depth + 1);
+                    try r.skipElement(k, depth + 1);
+                    try r.skipElement(v, depth + 1);
                 }
             },
             .@"struct" => {
@@ -117,6 +116,12 @@ pub const Reader = struct {
             },
             .stop, _ => return error.Malformed,
         }
+    }
+
+    /// Skips an element of a list, set or map, where a bool takes a byte
+    /// (in a struct, a bool field's value is its type).
+    fn skipElement(r: *Reader, t: Type, depth: usize) Error!void {
+        if (t == .bool_true or t == .bool_false) _ = try r.byte() else try r.skipDepth(t, depth);
     }
 
     fn byte(r: *Reader) Error!u8 {
@@ -178,4 +183,16 @@ test "read a struct, skipping unknown fields" {
         var t: Reader = .{ .buf = buf[0..n] };
         try std.testing.expectError(error.Malformed, t.skip(.@"struct"));
     }
+}
+
+test "a map longer than its bytes is malformed, not a runaway" {
+    // map, 2^63 - 1 entries of bool -> bool, in a few bytes.
+    const buf = "\xff\xff\xff\xff\xff\xff\xff\xff\x7f\x11" ++ "\x01\x01";
+    var r: Reader = .{ .buf = buf };
+    try std.testing.expectError(error.Malformed, r.skip(.map));
+
+    // map<bool, bool> { true: false }: a byte per bool.
+    var ok: Reader = .{ .buf = "\x01\x11\x01\x02" };
+    try ok.skip(.map);
+    try std.testing.expectEqual(4, ok.pos);
 }

@@ -37,6 +37,9 @@ pub const Error = error{
 
 /// Programs larger than this are rejected (e.g. `[a-z]{9999}`).
 const max_prog = 10_000;
+/// Deeper patterns are rejected: groups and quantifiers on quantifiers
+/// nest the tree, which is walked recursively.
+const max_depth = 256;
 
 const Set = std.bit_set.Integer(256);
 
@@ -144,6 +147,7 @@ const Parser = struct {
     src: []const u8,
     i: usize = 0,
     fold: bool, // ignore case: letters match both cases
+    depth: usize = 0, // nesting of the node being parsed
 
     fn peek(p: *const Parser) ?u8 {
         return if (p.i < p.src.len) p.src[p.i] else null;
@@ -174,7 +178,11 @@ const Parser = struct {
     // repeat := atom ('*' | '+' | '?' | '{n}' | '{n,}' | '{n,m}')*
     fn repeat(p: *Parser) Error!Node {
         var node = try p.atom();
+        const depth = p.depth;
+        defer p.depth = depth;
         while (p.peek()) |c| {
+            p.depth += 1;
+            if (p.depth > max_depth) return error.TooComplex;
             const r: [2]?u32 = switch (c) {
                 '*' => .{ 0, null },
                 '+' => .{ 1, null },
@@ -216,6 +224,9 @@ const Parser = struct {
         p.i += 1;
         switch (c) {
             '(' => {
+                p.depth += 1;
+                defer p.depth -= 1;
+                if (p.depth > max_depth) return error.TooComplex;
                 const inner = try p.alt();
                 if (p.peek() != ')') return error.UnbalancedParen;
                 p.i += 1;
@@ -386,6 +397,9 @@ fn firstBytes(a: Allocator, prog: []const Inst) Error!?Set {
 const Compiler = struct {
     arena: Allocator,
     prog: std.ArrayList(Inst) = .empty,
+    // Nodes compiled, repeats counted each time: an empty body emits
+    // nothing, so `max_prog` alone wouldn't stop `(){4000000000}`.
+    work: usize = 0,
 
     fn emit(c: *Compiler, inst: Inst) Error!u32 {
         if (c.prog.items.len >= max_prog) return error.TooComplex;
@@ -398,6 +412,8 @@ const Compiler = struct {
     }
 
     fn node(c: *Compiler, n: Node) Error!void {
+        c.work += 1;
+        if (c.work > 4 * max_prog) return error.TooComplex;
         switch (n) {
             .set => |s| _ = try c.emit(.{ .set = s }),
             .bol => _ = try c.emit(.bol),
@@ -719,8 +735,27 @@ test "regex errors" {
         .{ "a{x}", error.BadRepeat },
         .{ "a{2", error.BadRepeat },
         .{ "[a-z]{20000}", error.TooComplex },
+        .{ "(){4000000000}", error.TooComplex }, // emits nothing, but must not loop
     };
     for (cases) |c| try testing.expectError(c[1], Regex.compile(testing.allocator, c[0], false));
+
+    // Nesting deeper than max_depth is rejected; within it, fine.
+    var buf: [2000]u8 = undefined;
+    try testing.expectError(error.TooComplex, Regex.compile(testing.allocator, nested(&buf, 300), false));
+    var re = try Regex.compile(testing.allocator, nested(&buf, 200), false);
+    re.deinit();
+    var w: std.Io.Writer = .fixed(&buf);
+    try w.writeAll("a");
+    for (0..300) |_| try w.writeAll("{1}");
+    try testing.expectError(error.TooComplex, Regex.compile(testing.allocator, w.buffered(), false));
+}
+
+// `n` groups around an `a`: "((a))" for 2.
+fn nested(buf: []u8, n: usize) []const u8 {
+    @memset(buf[0..n], '(');
+    buf[n] = 'a';
+    @memset(buf[n + 1 ..][0..n], ')');
+    return buf[0 .. 2 * n + 1];
 }
 
 test "regex required literal" {

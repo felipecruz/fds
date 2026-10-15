@@ -84,6 +84,10 @@ pub const Schema = struct {
 };
 
 const max_depth = 64;
+/// Fields in a schema, nested ones included. FlatBuffer tables can be
+/// shared, so a few bytes can describe a field whose children are its own
+/// siblings: without a cap on the total, that is exponential work.
+const max_fields = 1 << 20;
 
 pub fn parseSchema(arena: Allocator, t: fb.Table) Error!Schema {
     if (try t.scalar(i16, 0, 0) != 0) return error.Unsupported; // big-endian
@@ -101,6 +105,7 @@ fn parseFields(arena: Allocator, vec: ?fb.Vector, count: *usize, depth: usize) E
         const type_id: TypeId = @enumFromInt(try t.scalar(u8, 2, 0));
         f.* = .{ .name = try t.string(0) orelse "", .type = type_id, .index = count.* };
         count.* += 1;
+        if (count.* > max_fields) return error.Malformed;
         if (try t.table(4)) |d| {
             var width: i32 = 32;
             var signed = true; // no index type given means int32

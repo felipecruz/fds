@@ -2,13 +2,36 @@
 
 ## Unreleased
 
+- **Hardening, from a security review:**
+  - **Text output is safe for a terminal:** control characters in values,
+    column names, map keys and paths are printed as `\xNN` (newlines as
+    `\n`, as before), so a file can't send escape sequences to the
+    terminal or forge output lines. stderr messages likewise.
+  - **Parquet:** a footer or page header with an unknown map field that
+    claims more entries than it has bytes made fds loop forever; it is
+    now a malformed file. Memory is per page, not per chunk, and positions
+    in lists and maps are computed for matches only, so a few bytes that
+    claim millions of nested values can't make fds allocate gigabytes. A
+    map's keys are read from its key column only when that column lines
+    up with the entries. A 0 byte in a column name is no longer misread.
+  - **Arrow:** a schema whose fields share their children (a few hundred
+    bytes) can't make exponential work, and buffer sizes a record batch
+    claims are checked against its body before planning. A stream with
+    many dictionary deltas is linear: 20,000 of them took 21 s, now 30 ms.
+  - **Files:** only regular files are read, and opening doesn't block,
+    so a FIFO (given, or put in a file's place during the search) can't
+    hang fds.
+  - **Regexes:** nesting deeper than 256 is rejected, and so are repeats
+    of an empty group that would loop for a long time (`(){4000000000}`).
+  - **C library:** `fds_match.at_len`; a match that couldn't be stored
+    (out of memory) is no longer counted.
 - **Where in the row:** a match in a list or map says where it is:
   `tags[1]` (list element 1), `m[key]` (the value of entry `key`),
   `m[key].key`, `a[0].b[2]`, in place of `tags[]` or `m[].value`. Every
   matching element is now a line (a row's list used to be reported
   once). `--json` adds `"at"` next to `"column"`, which stays the column
   path, as do `-c` and `--count` (still counting rows). In the C API,
-  `fds_match.at`.
+  `fds_match.at` (and `at_len`).
 - **Documentation in `docs/`**, one page per topic. Every example shows
   its real output, and CI fails if one changes (`docs/examples.py
   --check`). The same pages are built into the binary (`fds help

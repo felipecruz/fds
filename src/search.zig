@@ -200,7 +200,7 @@ pub const Searcher = struct {
     /// Searches one file. Files that can't be read or parsed are reported
     /// on stderr and skipped; matches found before the problem are kept.
     pub fn searchFile(s: *Searcher, dir: Io.Dir, name: []const u8, path: []const u8) !void {
-        const file = dir.openFile(s.io, name, .{}) catch |err| return s.warn(path, null, err);
+        const file = openRegular(s.io, dir, name) catch |err| return s.warn(path, null, err);
         defer file.close(s.io);
         const map = Map.open(s.io, s.gpa, file) catch |err| return s.warn(path, null, err);
         defer map.close(s.gpa);
@@ -309,7 +309,7 @@ pub const Searcher = struct {
                     },
                     .files_with_matches => {},
                 },
-                .callback => |cb| for (p.hits.items[0..@intCast(n)]) |h| {
+                .callback => |cb| for (p.hits.items[0..@min(n, p.hits.items.len)]) |h| {
                     if (s.stopped.load(.monotonic)) return;
                     const out = p.out.written();
                     const hit: Hit = .{ .path = f.path, .column = p.column, .at = out[h.at_start..][0..h.at_len], .row = h.row, .text = out[h.start..][0..h.len] };
@@ -334,7 +334,7 @@ pub const Searcher = struct {
                     try writeJsonField(w, "path", f.path);
                     try w.writeAll("}\n");
                 } else {
-                    try w.print("{s}{s}{s}\n", .{ color(o, .path), f.path, color(o, .reset) });
+                    try w.print("{s}{f}{s}\n", .{ color(o, .path), esc(f.path), color(o, .reset) });
                 }
             },
             .count => for (counts.items) |c| {
@@ -346,7 +346,7 @@ pub const Searcher = struct {
                     try writeJsonField(w, "column", c.column);
                     try w.print(",\"count\":{d}}}\n", .{c.n});
                 } else {
-                    try w.print("{s}{s}{s}:{s}{s}{s}:{d}\n", .{ color(o, .path), f.path, color(o, .reset), color(o, .column), c.column, color(o, .reset), c.n });
+                    try w.print("{s}{f}{s}:{s}{f}{s}:{d}\n", .{ color(o, .path), esc(f.path), color(o, .reset), color(o, .column), esc(c.column), color(o, .reset), c.n });
                 }
             },
         }
@@ -362,7 +362,7 @@ pub const Searcher = struct {
     pub fn notSearched(s: *Searcher, path: []const u8, column: []const u8, why: []const u8) void {
         s.errors.store(true, .monotonic);
         if (builtin.is_test) return;
-        std.debug.print("fds: {s}: column {s} not searched ({s})\n", .{ path, column, why });
+        std.debug.print("fds: {f}: column {f} not searched ({s})\n", .{ esc(path), esc(column), why });
     }
 
     /// Reports a file that can't be searched, on stderr.
@@ -374,9 +374,10 @@ pub const Searcher = struct {
             .parquet => "Parquet",
         } else "";
         switch (err) {
-            error.Malformed => std.debug.print("fds: {s}: not a valid {s} file\n", .{ path, name }),
-            error.Unsupported => std.debug.print("fds: {s}: uses a {s} feature fds does not support\n", .{ path, name }),
-            else => std.debug.print("fds: {s}: {t}\n", .{ path, err }),
+            error.Malformed => std.debug.print("fds: {f}: not a valid {s} file\n", .{ esc(path), name }),
+            error.Unsupported => std.debug.print("fds: {f}: uses a {s} feature fds does not support\n", .{ esc(path), name }),
+            error.NotRegularFile => std.debug.print("fds: {f}: not a regular file\n", .{esc(path)}),
+            else => std.debug.print("fds: {f}: {t}\n", .{ esc(path), err }),
         }
     }
 };
@@ -434,7 +435,6 @@ pub const Piece = struct {
         const same_row = p.last_row == row;
         p.last_row = row;
         if (same_row and s.mode() == .count) return;
-        p.count += 1;
         switch (s.output) {
             .print => |o| switch (o.mode) {
                 .matches => {
@@ -450,10 +450,10 @@ pub const Piece = struct {
                         try writeJsonField(out, "value", value);
                         try out.writeAll("}\n");
                     } else {
-                        try out.print("{s}{s}{s}:{s}{s}{s}:{s}{d}{s}", .{
-                            color(o, .path),   f.path, color(o, .reset),
-                            color(o, .column), at,     color(o, .reset),
-                            color(o, .row),    row,    color(o, .reset),
+                        try out.print("{s}{f}{s}:{s}{f}{s}:{s}{d}{s}", .{
+                            color(o, .path),   esc(f.path), color(o, .reset),
+                            color(o, .column), esc(at),     color(o, .reset),
+                            color(o, .row),    row,         color(o, .reset),
                         });
                         if (o.content) {
                             try out.writeByte(':');
@@ -464,6 +464,7 @@ pub const Piece = struct {
                 },
                 .count => {},
                 .files_with_matches => {
+                    p.count += 1;
                     @constCast(f).found.store(true, .monotonic);
                     return error.Enough; // one match is all -l needs
                 },
@@ -475,6 +476,9 @@ pub const Piece = struct {
                 try p.hits.append(s.gpa, .{ .row = row, .at_start = at_start, .at_len = at.len, .start = at_start + at.len, .len = value.len });
             },
         }
+        // Counted once stored: `report` takes `count` matches, and one that
+        // couldn't be stored (out of memory) mustn't be among them.
+        p.count += 1;
         if (s.opts.max_count) |max| if (p.count >= max) return error.Enough;
     }
 
@@ -487,13 +491,15 @@ pub const Piece = struct {
 const Collected = struct { row: u64, at_start: usize, at_len: usize, start: usize, len: usize };
 
 /// A map key in a value's place (`m[key]`), escaped so the place stays one
-/// unambiguous line: `\` `]` and line breaks as `\\`, `\]`, `\n`, `\r`.
+/// unambiguous, printable line: `\` `]` and line breaks as `\\`, `\]`,
+/// `\n`, `\r`, and other control bytes as `\xNN`.
 pub fn writeKey(arena: std.mem.Allocator, out: *std.ArrayList(u8), key: []const u8) !void {
     for (key) |c| switch (c) {
         '\\' => try out.appendSlice(arena, "\\\\"),
         ']' => try out.appendSlice(arena, "\\]"),
         '\n' => try out.appendSlice(arena, "\\n"),
         '\r' => try out.appendSlice(arena, "\\r"),
+        0...9, 11, 12, 14...0x1f, 0x7f => try out.print(arena, "\\x{x:0>2}", .{c}),
         else => try out.append(arena, c),
     };
 }
@@ -505,6 +511,18 @@ pub fn selected(columns: []const []const u8, top: []const u8, name: []const u8) 
         if (std.mem.eql(u8, c, top) or std.mem.eql(u8, c, name)) return true;
     }
     return false;
+}
+
+/// Opens a regular file to read. Anything else (a FIFO, a device) is
+/// error.NotRegularFile: opening is non-blocking, so a FIFO put in a file's
+/// place after the directory was listed can't hang the search.
+fn openRegular(io: Io, dir: Io.Dir, name: []const u8) !Io.File {
+    if (builtin.os.tag == .windows) return dir.openFile(io, name, .{});
+    const fd = try std.posix.openat(dir.handle, name, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true }, 0);
+    const file: Io.File = .{ .handle = fd, .flags = .{ .nonblocking = true } };
+    errdefer file.close(io);
+    if ((try file.stat(io)).kind != .file) return error.NotRegularFile;
+    return file;
 }
 
 /// The search for the term, literal or regex.
@@ -640,15 +658,34 @@ fn writeJsonField(w: *Io.Writer, key: []const u8, bytes: []const u8) !void {
     try w.writeByte('"');
 }
 
-// A value on one output line: newlines and carriage returns as \n and \r.
+// Text from a file (a value, a column name, a path) on one output line,
+// harmless to a terminal: newlines and carriage returns as \n and \r, and
+// other control bytes (escape sequences start with ESC) as \xNN. Tabs stay.
 fn writeEscaped(w: *Io.Writer, value: []const u8) !void {
-    var rest = value;
-    while (std.mem.indexOfAny(u8, rest, "\n\r")) |i| {
-        try w.writeAll(rest[0..i]);
-        try w.writeAll(if (rest[i] == '\n') "\\n" else "\\r");
-        rest = rest[i + 1 ..];
+    var start: usize = 0;
+    for (value, 0..) |c, i| {
+        if (c >= 0x20 and c != 0x7f or c == '\t') continue;
+        try w.writeAll(value[start..i]);
+        switch (c) {
+            '\n' => try w.writeAll("\\n"),
+            '\r' => try w.writeAll("\\r"),
+            else => try w.print("\\x{x:0>2}", .{c}),
+        }
+        start = i + 1;
     }
-    try w.writeAll(rest);
+    try w.writeAll(value[start..]);
+}
+
+const Escaped = struct {
+    bytes: []const u8,
+    pub fn format(e: Escaped, w: *Io.Writer) Io.Writer.Error!void {
+        return writeEscaped(w, e.bytes);
+    }
+};
+
+/// For `{f}`: `bytes` as `writeEscaped` prints them.
+fn esc(bytes: []const u8) Escaped {
+    return .{ .bytes = bytes };
 }
 
 const testing = std.testing;
@@ -878,4 +915,13 @@ test "highlighting and JSON escaping" {
     w = .fixed(&buf);
     try writeJsonField(&w, "v", "\xff\xfe");
     try testing.expectEqualStrings("\"v_base64\":\"//4=\"", w.buffered());
+
+    // Text output can't carry terminal escape sequences or forge lines.
+    w = .fixed(&buf);
+    try w.print("{f}", .{esc("a\x1b]0;t\x07\tb\nc\r\x7fé")});
+    try testing.expectEqualStrings("a\\x1b]0;t\\x07\tb\\nc\\r\\x7fé", w.buffered());
+    var key: std.ArrayList(u8) = .empty;
+    defer key.deinit(testing.allocator);
+    try writeKey(testing.allocator, &key, "a]\\\x1b\n");
+    try testing.expectEqualStrings("a\\]\\\\\\x1b\\n", key.items);
 }

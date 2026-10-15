@@ -23,6 +23,7 @@ pub const fds_match = extern struct {
     text: [*:0]const u8,
     text_len: usize,
     at: [*:0]const u8,
+    at_len: usize,
 };
 
 pub const fds_callback = *const fn (ctx: ?*anyopaque, m: *const fds_match) callconv(.c) c_int;
@@ -94,6 +95,7 @@ const State = struct {
             .text = @ptrCast(s.buf.items[text_start..].ptr),
             .text_len = hit.text.len,
             .at = @ptrCast(s.buf.items[at_start..].ptr),
+            .at_len = hit.at.len,
         };
         if (s.cb(s.ctx, &m) != 0) s.stopped = true;
         return !s.stopped;
@@ -109,7 +111,7 @@ const Rows = struct {
         const r: *Rows = @ptrCast(@alignCast(ctx));
         r.count += 1;
         r.ok = r.ok and std.mem.eql(u8, std.mem.span(m.path), "testdata/tree/plain.arrow") and
-            std.mem.eql(u8, std.mem.span(m.column), "name") and std.mem.eql(u8, std.mem.span(m.at), "name") and
+            std.mem.eql(u8, std.mem.span(m.column), "name") and std.mem.eql(u8, std.mem.span(m.at), "name") and m.at_len == 4 and
             std.mem.span(m.text).len == m.text_len;
         return @intFromBool(r.count >= r.stop_after);
     }

@@ -94,7 +94,11 @@ const Sink = struct {
         if (level >= max_levels) return null;
         if (k.keys[level] == null) {
             k.keys[level] = &.{};
-            for (k.job.file.columns) |kc| if (kc.leaf == key_leaf) {
+            // The key column's values line up with the map's entries only
+            // if each entry has exactly one key: required keys, directly in
+            // the entries. Otherwise (a malformed or odd file), positions.
+            const entry_def = k.job.column.levels[level].def;
+            for (k.job.file.columns) |kc| if (kc.leaf == key_leaf and kc.max_rep == level + 1 and kc.max_def == entry_def) {
                 k.keys[level] = try parquet.chunkValues(k.arena, k.job.group.chunks[key_leaf], kc);
             };
         }

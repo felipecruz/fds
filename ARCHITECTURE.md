@@ -92,6 +92,8 @@ map.zig      munmap (nothing left to tear down on Linux)
    dictionary keys. A delta adds values; a replacement (streams only)
    starts over. Either way a *new* `Dictionary` object is made, so the
    batches already queued keep the dictionary that was current for them.
+   Deltas share their chunks (each with its own match bitset) in a buffer
+   that only grows, never copied per delta, so many deltas stay linear.
 5. **Record batches** are cut into *pieces* (see *Pieces* below). A
    batch's `BatchWork` keeps its layout (`Batch.layout`), its first row
    in the file and its dictionaries as they were at that point, and
@@ -270,7 +272,10 @@ which may have started on an earlier page (`rowsOf`). Present values (the
 maximum definition level) are mapped to their row, and the sink gets them
 in row order, with its `Position`: per level, its index in its list and
 its entry's number in the chunk, which finds a map's key in the key
-column's chunk (`parquet.chunkValues`, read at the first match).
+column's chunk (`parquet.chunkValues`, read at the first match, and only
+if the key column's levels match the map's entries one to one).
+Positions are found for matches only, by replaying the page's levels
+from its start (`Cursor`): one pass per page, no memory per value.
 
 **Pieces.** One per searched column per row group, in output order (row
 group, then column). Each chunk is its own byte range of the file, so a
@@ -315,7 +320,8 @@ counts are never trusted alone. A page may hold at most 16 M values
 (`max_page_values`; real pages hold thousands). A delta header's count
 must equal the number of present values. Rebuilt `DELTA_BYTE_ARRAY`
 values are capped at 256 MB per page. Everything else is checked against
-the bytes actually there.
+the bytes actually there. A data page's decoded levels and values live in
+an arena freed after the page, so a chunk costs one page's memory.
 
 ## Decompression (`src/codecs.zig`)
 
@@ -500,7 +506,11 @@ and `Searcher.report` writes a file's pieces in order under the output
 mutex. The output modes are decided in those two places:
 
 - **Matches** (the default): `record` formats one line per match,
-  `path:column:row[:value]`, or a JSON object with `--json`. With colors,
+  `path:column:row[:value]`, or a JSON object with `--json`. Everything
+  that comes from a file or a file name (value, place, column, path, and
+  the same on stderr) goes through `writeEscaped`: line breaks as `\n`
+  and `\r`, other control bytes as `\xNN`, so a file can't forge lines or
+  send the terminal escape sequences. With colors,
   `writeContent` highlights each match in the value: `Matcher.span` finds
   it, through `match.indexOf` for literals or `regex.span` for regexes (an
   anchored run of the VM per candidate start, keeping the longest end;

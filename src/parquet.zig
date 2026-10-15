@@ -198,7 +198,10 @@ fn walk(arena: Allocator, elems: []const Element, i: *usize, leaves: *std.ArrayL
     i.* += 1;
     const repeated = e.repetition == 2;
     const joined = if (up.name.len == 0) e.name else try std.fmt.allocPrint(arena, "{s}.{s}", .{ up.name, e.name });
-    const joined_shape = if (up.name.len == 0) e.name else try std.fmt.allocPrint(arena, "{s}.{s}", .{ up.shape, e.name });
+    // In the shape, a 0 byte marks a level: a 0 in a name is written as
+    // the text `\x00`, as the output would escape it anyway.
+    const shape_name = try std.mem.replaceOwned(u8, arena, e.name, "\x00", "\\x00");
+    const joined_shape = if (up.name.len == 0) shape_name else try std.fmt.allocPrint(arena, "{s}.{s}", .{ up.shape, shape_name });
     var name: []const u8 = undefined;
     var shape: []const u8 = undefined;
     switch (place) {
@@ -485,6 +488,11 @@ pub fn searchChunk(arena: Allocator, chunk: Chunk, column: Column, matcher: anyt
     var rows: Nest = .{ .index = try arena.alloc(u32, column.max_rep), .entry = try arena.alloc(u64, column.max_rep) };
     @memset(rows.index, 0);
     @memset(rows.entry, 0);
+    // A data page's levels, values and row map are needed only while it is
+    // searched: freed after each page, so memory is one page's, not the
+    // chunk's (a page claims up to `max_page_values` values in a few bytes).
+    var page_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer page_arena.deinit();
     while (pos < chunk.bytes.len and entries < chunk.num_values) {
         var r: thrift.Reader = .{ .buf = chunk.bytes, .pos = pos };
         const h = try PageHeader.parse(&r);
@@ -499,7 +507,8 @@ pub fn searchChunk(arena: Allocator, chunk: Chunk, column: Column, matcher: anyt
             },
             .data, .data_v2 => {
                 if (h.num_values > max_page_values) return error.Unsupported;
-                try searchPage(arena, codec, h, page, column, if (dict) |*d| d else null, matcher, &rows, sink);
+                defer _ = page_arena.reset(.{ .retain_with_limit = 4 << 20 });
+                try searchPage(page_arena.allocator(), codec, h, page, column, if (dict) |*d| d else null, matcher, &rows, sink);
                 entries += h.num_values;
             },
             else => {}, // index pages
@@ -515,7 +524,7 @@ pub fn chunkValues(arena: Allocator, chunk: Chunk, column: Column) ![]const []co
         out: *std.ArrayList([]const u8),
         arena: Allocator,
         pub fn onValue(c: @This(), _: usize, _: Position, value: []const u8) !void {
-            try c.out.append(c.arena, value);
+            try c.out.append(c.arena, try c.arena.dupe(u8, value)); // pages are freed
         }
     };
     try searchChunk(arena, chunk, column, everything, Collect{ .out = &out, .arena = arena });
@@ -573,7 +582,8 @@ fn searchPage(arena: Allocator, codec: codecs.Codec, h: PageHeader, page: []cons
     if (column.max_rep == 0) map.slots = try presentSlots(arena, def_levels, column.max_def, h.num_values);
 
     const n = if (map.slots) |s| s.len else h.num_values;
-    const slot_sink: Slots(@TypeOf(sink)) = .{ .sink = sink, .map = map, .depth = column.max_rep };
+    var cursor: Cursor = if (column.max_rep > 0) try .init(arena, map, column) else undefined;
+    const slot_sink: Slots(@TypeOf(sink)) = .{ .sink = sink, .map = map, .cursor = if (column.max_rep > 0) &cursor else null };
 
     switch (h.encoding) {
         .plain => {
@@ -614,15 +624,16 @@ fn lengthPrefixed(rest: *[]const u8) Error![]const u8 {
 }
 
 // Maps the index of a value among the page's present values to its row
-// in the chunk (`base` + its slot) and its position in the row.
+// in the chunk (`base` + its slot) and, in a repeated column, its position
+// in the row (from `cursor`).
 fn Slots(comptime Sink: type) type {
     return struct {
         sink: Sink,
         map: RowMap,
-        depth: usize, // repetition levels
+        cursor: ?*Cursor,
         pub fn onValue(s: @This(), i: usize, value: []const u8) !void {
             const m = s.map;
-            const at: Position = if (s.depth == 0) .{} else .{ .index = m.index[i * s.depth ..][0..s.depth], .entry = m.entry[i * s.depth ..][0..s.depth] };
+            const at: Position = if (s.cursor) |c| try c.position(i) else .{};
             try s.sink.onValue(m.base + if (m.slots) |sl| sl[i] else i, at, value);
         }
     };
@@ -631,11 +642,72 @@ fn Slots(comptime Sink: type) type {
 const RowMap = struct {
     slots: ?[]const u32,
     base: usize,
-    // In a repeated column, each present value's `Position`, `depth`
-    // numbers per value.
-    index: []const u32 = &.{},
-    entry: []const u64 = &.{},
+    // In a repeated column: the page's levels, and the `Nest` positions
+    // as of its start, from which a value's `Position` is replayed.
+    reps: []const u32 = &.{},
+    defs: []const u32 = &.{},
+    start_index: []const u32 = &.{},
+    start_entry: []const u64 = &.{},
 };
+
+// Finds the `Position` of present values of a page, replaying its levels
+// as `rowsOf` did. Matches come in order, so each call carries on from the
+// last: a page costs one pass, whatever its depth, and no memory per value.
+const Cursor = struct {
+    map: RowMap,
+    column: Column,
+    next: usize = 0, // the next level entry to replay
+    present: usize = 0, // present values replayed
+    index: []u32,
+    entry: []u64,
+    out: []u64, // `entry` minus one: the value's own entries
+
+    fn init(arena: Allocator, map: RowMap, column: Column) !Cursor {
+        var c: Cursor = .{
+            .map = map,
+            .column = column,
+            .index = try arena.dupe(u32, map.start_index),
+            .entry = try arena.dupe(u64, map.start_entry),
+            .out = try arena.alloc(u64, column.max_rep),
+        };
+        c.rewind();
+        return c;
+    }
+
+    fn rewind(c: *Cursor) void {
+        @memcpy(c.index, c.map.start_index);
+        @memcpy(c.entry, c.map.start_entry);
+        c.next = 0;
+        c.present = 0;
+    }
+
+    // The position of present value `i`.
+    fn position(c: *Cursor, i: usize) Error!Position {
+        if (i < c.present) c.rewind(); // out of order: start over
+        while (c.next < c.map.reps.len) {
+            const r = c.map.reps[c.next];
+            const d = c.map.defs[c.next];
+            c.next += 1;
+            advance(c.column, r, d, c.index, c.entry);
+            if (d != c.column.max_def) continue;
+            c.present += 1;
+            if (c.present - 1 < i) continue;
+            for (c.out, c.entry) |*o, e| o.* = std.math.sub(u64, e, 1) catch return error.Malformed;
+            return .{ .index = c.index, .entry = c.out };
+        }
+        return error.Malformed; // rowsOf counted fewer present values
+    }
+};
+
+// Moves the positions past one level entry (repetition level r,
+// definition level d): see `rowsOf`.
+fn advance(column: Column, r: u32, d: u32, index: []u32, entry: []u64) void {
+    for (column.levels, 0..) |l, j| {
+        const level = j + 1;
+        if (r < level) index[j] = 0 else if (r == level) index[j] +|= 1;
+        if (r <= level and d >= l.def) entry[j] += 1;
+    }
+}
 
 // Where the chunk's pages have got to: rows started, and in a repeated
 // column, the current entry at each level (see `Position`).
@@ -653,7 +725,6 @@ const Nest = struct {
 // the list at level r; the lists below it start over.
 fn rowsOf(arena: Allocator, rep_levels: []const u8, def_levels: []const u8, column: Column, n: usize, nest: *Nest) Error!RowMap {
     const base = nest.rows;
-    const depth: usize = column.max_rep;
     const reps = try hybrid(arena, rep_levels, bitWidth(column.max_rep), n);
     const defs = try hybrid(arena, def_levels, bitWidth(column.max_def), n);
     if (n == 0) return .{ .slots = &.{}, .base = base };
@@ -663,27 +734,27 @@ fn rowsOf(arena: Allocator, rep_levels: []const u8, def_levels: []const u8, colu
     var count: usize = 0;
     for (defs) |l| count += @intFromBool(l == column.max_def);
     const slots = try arena.alloc(u32, count);
-    const index = try arena.alloc(u32, count * depth);
-    const entry = try arena.alloc(u64, count * depth);
+    const map: RowMap = .{
+        .slots = slots,
+        .base = base - @intFromBool(continues),
+        .reps = reps,
+        .defs = defs,
+        .start_index = try arena.dupe(u32, nest.index),
+        .start_entry = try arena.dupe(u64, nest.entry),
+    };
     var row: u32 = 0;
     var k: usize = 0;
     for (reps, defs, 0..) |r, d, i| {
         if (r > column.max_rep or d > column.max_def) return error.Malformed;
         if (r == 0 and i > 0) row += 1;
-        for (column.levels, 0..) |l, j| {
-            const level = j + 1;
-            if (r < level) nest.index[j] = 0 else if (r == level) nest.index[j] +|= 1;
-            if (r <= level and d >= l.def) nest.entry[j] += 1;
-        }
+        advance(column, r, d, nest.index, nest.entry);
         if (d == column.max_def) {
             slots[k] = row;
-            @memcpy(index[k * depth ..][0..depth], nest.index);
-            for (entry[k * depth ..][0..depth], nest.entry) |*e, ne| e.* = std.math.sub(u64, ne, 1) catch return error.Malformed;
             k += 1;
         }
     }
-    nest.rows = base - @intFromBool(continues) + row + 1;
-    return .{ .slots = slots, .base = base - @intFromBool(continues), .index = index, .entry = entry };
+    nest.rows = map.base + row + 1;
+    return map;
 }
 
 // The rows (within the page) that hold a value, or null if all do.

@@ -97,8 +97,16 @@ fn rowsPerPiece(b: *const BatchWork, t: Target, piece_bytes: usize) ?usize {
     const n = b.batch.len(col) catch return null;
     // The array's bytes: offsets and data, or views and their data buffers.
     const buffers: usize = if (t.leaf.type == .utf8_view) 1 + col.variadic else 2;
+    // Lengths the file claims: each must fit in the body, and every row
+    // takes bytes of offsets or views, so the pieces stay as few as the
+    // file is large, whatever the file says.
     var bytes: usize = 0;
-    for (0..buffers) |i| bytes += b.batch.bufferLen(col.buffer + 1 + i) catch return null;
+    for (0..buffers) |i| {
+        const len = b.batch.bufferLen(col.buffer + 1 + i) catch return null;
+        if (len > b.batch.body.len) return null;
+        bytes += len;
+    }
+    if (n > bytes) return null;
     const pieces = bytes / piece_bytes;
     if (pieces < 2 or n < 2) return null;
     return std.math.divCeil(usize, n, pieces) catch unreachable;
@@ -143,7 +151,7 @@ pub const Job = struct {
                 if (!arrow.validBit(ix.validity, i)) continue;
                 const key = ix.get(i) orelse return error.Malformed;
                 if (key >= values.len) return error.Malformed;
-                if (values.matches.isSet(@intCast(key))) try sink.onValue(i, values.get(@intCast(key)));
+                if (values.isMatch(@intCast(key))) try sink.onValue(i, values.get(@intCast(key)));
             }
         } else {
             const strings = if (job.rows) |r|
@@ -245,46 +253,77 @@ fn hasStrings(f: *const arrow.Field) bool {
 }
 
 // The values of one dictionary, with the keys whose value matches. Values
-// arrive in chunks: the first batch, then deltas.
+// arrive in chunks: the first batch, then deltas. Each batch keeps the
+// dictionary as it was, so a delta makes a new `Dictionary`; its chunks are
+// shared with the earlier ones (deltas only append), so many deltas cost
+// linear time and memory, not quadratic.
 const Dictionary = struct {
-    chunks: []const arrow.Strings,
-    first: []const usize, // first key of each chunk
+    chunks: []const Chunk,
     len: usize,
-    matches: std.DynamicBitSetUnmanaged,
     any: bool,
+    grow: *Growing,
+
+    const Chunk = struct {
+        strings: arrow.Strings,
+        first: usize, // its first key
+        matches: std.DynamicBitSetUnmanaged,
+    };
+
+    // The chunks of one dictionary id, appended in place. A full buffer is
+    // copied to a larger one and left as it is, since earlier
+    // dictionaries (maybe being searched) still read it.
+    const Growing = struct { buf: []Chunk = &.{}, len: usize = 0 };
 
     // A new dictionary: `prev` (for a delta) plus `strings`, searched now.
     fn add(arena: Allocator, prev: ?*const Dictionary, strings: arrow.Strings, matcher: Matcher) !*const Dictionary {
         const base = if (prev) |p| p.len else 0;
+        const g = if (prev) |p| p.grow else try arena.create(Growing);
+        if (prev == null) g.* = .{};
+        if (g.len == g.buf.len) {
+            const buf = try arena.alloc(Chunk, @max(4, 2 * g.len));
+            @memcpy(buf[0..g.len], g.buf[0..g.len]);
+            g.buf = buf;
+        }
+        const c = &g.buf[g.len];
+        c.* = .{ .strings = strings, .first = base, .matches = try .initEmpty(arena, strings.len) };
+        try findStrings(matcher, strings, DictSink{ .matches = &c.matches, .strings = strings });
+        g.len += 1;
         const d = try arena.create(Dictionary);
         d.* = .{
-            .chunks = try std.mem.concat(arena, arrow.Strings, &.{ if (prev) |p| p.chunks else &.{}, &.{strings} }),
-            .first = try std.mem.concat(arena, usize, &.{ if (prev) |p| p.first else &.{}, &.{base} }),
+            .chunks = g.buf[0..g.len],
             .len = base + strings.len,
-            .matches = try .initEmpty(arena, base + strings.len),
-            .any = false,
+            .any = (if (prev) |p| p.any else false) or c.matches.count() > 0,
+            .grow = g,
         };
-        if (prev) |p| {
-            var it = p.matches.iterator(.{});
-            while (it.next()) |k| d.matches.set(k);
-        }
-        try findStrings(matcher, strings, DictSink{ .d = d, .base = base, .strings = strings });
-        d.any = d.matches.count() > 0;
         return d;
     }
 
+    // The chunk holding `key` (< len).
+    fn chunk(d: *const Dictionary, key: usize) *const Chunk {
+        var lo: usize = 0; // the last chunk whose first key is <= key
+        var hi: usize = d.chunks.len;
+        while (hi - lo > 1) {
+            const mid = lo + (hi - lo) / 2;
+            if (d.chunks[mid].first <= key) lo = mid else hi = mid;
+        }
+        return &d.chunks[lo];
+    }
+
     fn get(d: *const Dictionary, key: usize) []const u8 {
-        var i = d.chunks.len - 1;
-        while (d.first[i] > key) i -= 1;
-        return d.chunks[i].get(key - d.first[i]);
+        const c = d.chunk(key);
+        return c.strings.get(key - c.first);
+    }
+
+    fn isMatch(d: *const Dictionary, key: usize) bool {
+        const c = d.chunk(key);
+        return c.matches.isSet(key - c.first);
     }
 
     const DictSink = struct {
-        d: *Dictionary,
-        base: usize,
+        matches: *std.DynamicBitSetUnmanaged,
         strings: arrow.Strings,
         pub fn onValue(k: DictSink, i: usize, _: []const u8) !void {
-            if (k.strings.isValid(i)) k.d.matches.set(k.base + i);
+            if (k.strings.isValid(i)) k.matches.set(i);
         }
     };
 };

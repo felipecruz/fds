@@ -69,7 +69,8 @@ views) and files it can't read are reported on standard error.
 
 **\--content**
 :   Also print the value: *path*:*column*:*row*:*value*. Newlines in it
-    are printed as **\\n**.
+    are printed as **\\n**, and other control characters (escape
+    sequences included) as **\\xNN** (two hex digits), in values, columns and paths alike.
 
 **-l**, **\--files-with-matches**
 :   Print only the files that match; each file's search stops at its first

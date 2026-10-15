@@ -225,7 +225,7 @@ fn usage(status: u8) noreturn {
         \\                       path like user.name or tags[]); repeatable
         \\output:
         \\  --content            also print the value: <path>:<column>:<row>:<value>
-        \\                       (newlines in it as \n)
+        \\                       (newlines as \n, other control bytes as \xNN)
         \\  -l, --files-with-matches   print only the files that match
         \\  --count              print <path>:<column>:<count> per matching column
         \\  -m, --max-count N    stop after N matches in each file

@@ -9,7 +9,10 @@ examples run in `testdata/tree` (see
 ## The value: `--content`
 
 `path:column:row:value`. Newlines and carriage returns in the value are
-printed as `\n` and `\r`, so a match is always one line.
+printed as `\n` and `\r`, so a match is always one line, and other control
+characters as `\xNN` (`\x1b` for escape), so a file can't send your
+terminal escape sequences. Column names, map keys and paths are printed
+the same way.
 
 ```console
 $ fds --content -c note plain.arrow needle

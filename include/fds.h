@@ -35,6 +35,7 @@ typedef struct fds_match {
     size_t text_len;
     const char *at;     /* its place in the row: "tags[1]", "m[key]", "m[key].key";
                            the column itself at the top level. NUL-terminated */
+    size_t at_len;
 } fds_match;
 
 /* Called once per matching value. Never called concurrently; one

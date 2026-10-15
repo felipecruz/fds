@@ -82,7 +82,9 @@ Repeatable.
 \f[B]\-\-content\f[R]
 Also print the value:
 \f[I]path\f[R]:\f[I]column\f[R]:\f[I]row\f[R]:\f[I]value\f[R].
-Newlines in it are printed as \f[B]\(rsn\f[R].
+Newlines in it are printed as \f[B]\(rsn\f[R], and other control
+characters (escape sequences included) as \f[B]\(rsxNN\f[R] (two hex
+digits), in values, columns and paths alike.
 .TP
 \f[B]\-l\f[R], \f[B]\-\-files\-with\-matches\f[R]
 Print only the files that match; each file\(cqs search stops at its
