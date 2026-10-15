@@ -27,7 +27,7 @@ import pandas as pd
 
 out = subprocess.run(["fds", "--json", "parquet/snappy.parquet", "needle"],
                      capture_output=True, text=True).stdout
-hits = pd.read_json(io.StringIO(out), lines=True)  # path, column, row, value
+hits = pd.read_json(io.StringIO(out), lines=True)  # path, column, at, row, value
 df = pd.read_parquet("parquet/snappy.parquet")
 print(df.iloc[hits.row.unique()])                  # the matching rows, every column
 ```

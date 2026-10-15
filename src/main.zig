@@ -229,7 +229,7 @@ fn usage(status: u8) noreturn {
         \\  -l, --files-with-matches   print only the files that match
         \\  --count              print <path>:<column>:<count> per matching column
         \\  -m, --max-count N    stop after N matches in each file
-        \\  --json               JSON Lines: {{"path","column","row","value"}}
+        \\  --json               JSON Lines: {{"path","column","at","row","value"}}
         \\  --color WHEN         auto (a terminal; default), always or never
         \\other:
         \\  -j N|auto            worker threads (default: auto = {d} here, the

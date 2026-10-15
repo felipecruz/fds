@@ -152,5 +152,5 @@ JSON Lines, for **jq** or pandas:
 
 **grep**(1), **rg**(1)
 
-The documentation: *docs/README.md* in the repository,
-<https://github.com/felipecruz/fds/tree/main/docs>
+The documentation: **fds help**, *docs/README.md* in the repository, and
+<https://felipecruz.github.io/fds/>

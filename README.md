@@ -172,113 +172,11 @@ find the same matches for every pattern.
 The scripts are `bench/regex.sh` (results in `results/regex-*.md`) and
 `bench/regex_others.py`.
 
-## What gets searched
+### Many terms
 
-Every string value the schema has. In **Arrow** files:
-
-- `utf8` (`string`), `large_utf8` (`large_string`) and `utf8_view` (`string_view`);
-- dictionary-encoded strings (pandas categoricals): each distinct value
-  is searched once, then rows are matched by their index;
-- strings nested in structs, lists, large lists, fixed-size lists and maps,
-  at any depth.
-
-In **Parquet** files: `BYTE_ARRAY` columns annotated as text (`STRING`,
-`ENUM` or `JSON`), at the top level, inside structs (`user.name`), and
-inside lists and maps (`tags[]`, `m[].key`, `m[].value`), at any depth.
-Column paths are the same in both formats.
-
-**Nothing is skipped silently.** Binary columns are not text and are not
-searched. Strings fds can't search, inside Arrow unions, run-end-encoded
-arrays or list views, are reported on stderr
-(`fds: <path>: column u not searched (strings in a union)`), and the exit
-status is 2, as for an unreadable file: a "no match" is never an
-incomplete search. `-c` leaves out the columns it doesn't select.
-
-## Usage
-
-```
-fds [options] <path> <term>
-fds [options] -e <term> [-e <term>]... <path>
-fds [options] -f <file> <path>
-
-matching:
-  -i, --ignore-case    ASCII case-insensitive
-  -S, --smart-case     ignore case unless a term has an upper-case letter
-  -E, --regex          terms are regexes: . [a-z] [^0-9] \d \w \s \b ^ $ * + ? {n,m} | ( ) \n
-  -w, --word           whole words only
-  -e, --regexp TERM    a term; repeat to match any of several
-  -f, --file FILE      terms, one per line (- for stdin); thousands are fine
-  -c, --column NAME    search only this column: a top-level name, or a path
-                       like user.name or tags[]; repeatable
-output:
-  --content            print path:column:row:value instead of path:column:row
-  -l, --files-with-matches   print only the files that match
-  --count              print path:column:count for each column with matches
-  -m, --max-count N    stop after N matches in each file
-  --json               JSON Lines (see below)
-  --color WHEN         auto (default: a terminal, unless NO_COLOR is set),
-                       always or never
-other:
-  -j N|auto            worker threads (default: auto = all CPUs; performance
-                       cores on Apple silicon)
-```
-
-`<path>` is a directory (every `.arrow`, `.feather`, `.arrows` and
-`.parquet` file under it is searched) or a single file (searched whatever
-its name; the format comes from its first bytes). Output is one line per
-matching value:
-
-```
-$ fds data needle --content
-data/events.arrow:name:0:needle
-data/events.arrow:user.name:4:needles
-data/events.arrow:tags[1]:3:needle
-data/events.arrow:m[color]:0:needle
-```
-
-- **Rows are 0-based** and count from the start of the file, across record
-  batches or row groups, so `df.iloc[row]` finds them.
-- **Where in the row:** a struct field is `user.name`, a list's element 1
-  is `tags[1]`, a map's value for key `color` is `m[color]` (and the key
-  itself `m[color].key`). Each matching value is a line. `-c` and
-  `--count` use column paths, without positions: `tags[]`, `m[].value`.
-- **Order:** files come out in no fixed order. Within a file, matches are
-  ordered by record batch, then column, then row; `-m N` keeps the file's
-  first N in that order.
-- `^` and `$` match at the start and end of the value. In `--content`
-  output, newlines in values are printed as `\n`. On a terminal, paths,
-  columns, rows and the matched text are colored, as in ripgrep.
-- **Exit status**, as in grep: 0 if something matched, 1 if nothing did,
-  2 if a file couldn't be read (even if others matched).
-
-**`--json`** prints one object per line, ready for `jq` or
-`pandas.read_json(..., lines=True)`:
-
-```
-{"path":"data/events.arrow","column":"note","row":4,"value":"needle\nline"}
-```
-
-A value (or path) that isn't valid UTF-8 is given as `"value_base64"`
-instead, since JSON strings can't hold arbitrary bytes. With `-l`, the
-objects are `{"path"}`; with `--count`, `{"path","column","count"}`.
-
-**Speed of the modes**, `checkout` in the 2.3 GB Arrow file (4.4 M
-matches): printing them all 150 ms, `--count` 68 ms, `-m 1` 21 ms, `-l`
-5 ms (it stops at the first match). `-e a -e b` searches each literal with
-the SIMD loop (272 ms for two); `-E` alternations, and `-w` with a few
-terms, run the regex engine on candidate values.
-
-### Many terms (`-f`)
-
-`-f terms.txt` reads the terms from a file, one per line (empty lines are
-ignored; `-f -` reads stdin). From 8 terms on, fds searches them all in
-one pass with an Aho-Corasick automaton, so the time hardly depends on how
-many there are. That is the shape of scanning jobs: does any of these
-10,000 benchmark questions appear in my training data, which rows hold
-one of these customer IDs or leaked keys? `-i` and `-w` work as with one
-term.
-
-`--count -f` on the same 2.3 GB Arrow file and 740 MB Parquet file:
+`--count -f` on the same 2.3 GB Arrow file and 740 MB Parquet file. From
+8 terms on, fds searches them all in one Aho-Corasick pass, so the time
+hardly depends on how many there are ([Many terms](docs/many-terms.md)):
 
 | Terms | Arrow (2.3 GB) | Parquet (740 MB) |
 |---:|---:|---:|
@@ -292,6 +190,71 @@ The term files are random strings, 8 to 24 bytes, with one in a hundred a
 host name that occurs in the data. Up to 7 terms, one SIMD pass each is
 faster (about 40 ms per term on the Arrow file). The script is
 `bench/terms.sh`.
+
+## What gets searched
+
+Every string value the schema has, at any depth: in **Arrow** files,
+`utf8`, `large_utf8` and `utf8_view` columns, dictionary-encoded or not,
+and in structs, lists, fixed-size lists and maps; in **Parquet** files,
+`BYTE_ARRAY` columns annotated as text, in structs, lists and maps.
+Arrow files and streams, uncompressed or LZ4 or zstd; Parquet with
+Snappy, gzip, zstd, LZ4 or none, pages v1 and v2, every string encoding.
+Checked against files written by pyarrow, pandas, polars, DuckDB,
+fastparquet, Arrow JS and Hugging Face `datasets` and Hub files.
+[Formats](docs/formats.md) has the details.
+
+**Nothing is skipped silently.** Binary columns are not text and are not
+searched. Strings fds can't search, inside Arrow unions, run-end-encoded
+arrays or list views, are reported on stderr
+(`fds: <path>: column u not searched (strings in a union)`), and the exit
+status is 2, as for an unreadable file: a "no match" is never an
+incomplete search. A malformed file is reported and skipped; every
+offset, length and count read from a file is checked first, and no size a
+file claims can make fds allocate more than the data could produce.
+
+## Usage
+
+```
+fds [options] <path> <term>
+fds [options] -e <term> [-e <term>]... <path>
+fds [options] -f <file> <path>
+```
+
+`<path>` is a directory (every `.arrow`, `.feather`, `.arrows` and
+`.parquet` file under it) or a single file (whatever its name: the format
+comes from its first bytes). `-i -E -w -e -f -l -m` work as in grep,
+`-S` as in ripgrep; `-c NAME` searches one column (counting is
+`--count`), and `--content`, `--json`, `--color` and `-j` do the rest.
+`fds --help` lists them, and [docs/](docs/README.md) and `man fds`
+explain each. Output is one line per matching value, with its place in
+the row:
+
+```
+$ fds data needle --content
+data/events.arrow:name:0:needle
+data/events.arrow:user.name:4:needles
+data/events.arrow:tags[1]:3:needle
+data/events.arrow:m[color]:0:needle
+```
+
+- **Rows are 0-based** and count from the start of the file, across record
+  batches or row groups, so `df.iloc[row]` finds them.
+- **Where in the row:** a struct field is `user.name`, a list's element 1
+  is `tags[1]`, a map's value for key `color` is `m[color]` (and the key
+  itself `m[color].key`). `-c` and `--count` use column paths, without
+  positions: `tags[]`, `m[].value`.
+- **Order:** files come out in no fixed order. Within a file, matches are
+  ordered by record batch, then column, then row.
+- **`--json`** gives JSON Lines, `{"path","column","at","row","value"}`,
+  for `jq` or `pandas.read_json(..., lines=True)`.
+- **Exit status**, as in grep: 0 if something matched, 1 if nothing did,
+  2 if a file couldn't be read (even if others matched).
+
+**`-f terms.txt`** searches thousands of terms in one pass (an
+Aho-Corasick automaton): 10,000 terms take about as long as 8 (see
+[Many terms](#many-terms)). That is the shape of scanning jobs: does any
+of these benchmark questions appear in my training data, which rows hold
+one of these customer IDs?
 
 ## Building
 
@@ -326,44 +289,9 @@ static int on_match(void *ctx, const fds_match *m) {
 fds_search("data", "needle", FDS_IGNORE_CASE, 0, on_match, NULL);
 ```
 
-## Formats
-
-**Arrow:**
-
-- The IPC file format (`.arrow`, `.feather`, which is Feather v2) and the
-  IPC stream format (`.arrows`), including old streams without the
-  continuation marker.
-- Buffers compressed with LZ4 frame (what pyarrow's `write_feather` uses
-  by default) or zstd. LZ4 is built in (`src/lz4.zig`); zstd is the
-  reference decoder (`third_party/zstd`).
-- Dictionary batches, including deltas and (in streams) replacements.
-- Not supported: Feather v1 (2016) and big-endian files. Such files are
-  reported on stderr and skipped.
-
-Checked against files written by pyarrow (`ipc`, `feather`, pandas
-`to_feather`), polars (`write_ipc`, `write_ipc_stream`; all compression
-and compat levels), Arrow JS, and the Hugging Face `datasets` cache
-(Arrow streams named `.arrow`), with `testdata/check.py`.
-
-**Parquet:**
-
-- Codecs: uncompressed, Snappy, gzip, zstd, LZ4 (`LZ4_RAW` and the older
-  Hadoop-framed `LZ4`). Snappy and LZ4 decoders are built in, zstd is the
-  reference decoder, gzip comes from Zig's standard library. Not
-  supported: LZO and Brotli.
-- Data pages v1 and v2; string encodings `PLAIN`, `RLE_DICTIONARY` /
-  `PLAIN_DICTIONARY`, `DELTA_LENGTH_BYTE_ARRAY` and `DELTA_BYTE_ARRAY`.
-- Not supported: encrypted files, and columns stored in other files.
-
-Checked against files written by pyarrow and pandas, polars, DuckDB
-(including its v2 mode), fastparquet, and Parquet files from the Hugging
-Face Hub (`squad`, `ag_news`, `imdb`).
-
-A malformed file is reported (`fds: <path>: not a valid Parquet file`, or
-`Arrow IPC`) and skipped; matches found before the problem are still
-printed. Every offset, length and count read from a file is checked first,
-and no size a file claims can make fds allocate more than the data could
-produce.
+[`examples/count.c`](examples/count.c) is a complete program (`zig build
+c-example -- testdata/tree needle`), and [Scripting](docs/scripting.md#the-c-library)
+says what the callback can count on.
 
 ## Limitations
 
