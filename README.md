@@ -32,6 +32,35 @@ first, but most pages never are: a dictionary-encoded page is skipped,
 undecompressed, when no dictionary entry matched, and a plain page is
 skipped, undecoded, when its raw bytes don't contain the term.
 
+## Examples
+
+On the test files in this repository (`cd testdata/tree`): one table, as
+Arrow and as Parquet, with every kind of string column.
+
+```console
+$ fds --content parquet/snappy.parquet 'a needle'
+parquet/snappy.parquet:name:4:a needle here
+$ fds -w --content -c name -c user plain.arrow needle
+plain.arrow:name:0:needle
+plain.arrow:user.name:0:needle
+plain.arrow:name:4:a needle here
+$ fds --count -c tags -c cat parquet/snappy.parquet needle
+parquet/snappy.parquet:tags[]:2
+parquet/snappy.parquet:cat:2
+$ fds -E --content -c name -c tags parquet/snappy.parquet '^needle$'
+parquet/snappy.parquet:name:0:needle
+parquet/snappy.parquet:tags[]:0:needle
+parquet/snappy.parquet:tags[]:3:needle
+$ printf 'haystack\nbob\n' | fds -f - --content parquet/snappy.parquet
+parquet/snappy.parquet:name:3:haystack
+parquet/snappy.parquet:user.name:2:bob
+$ fds --json -c note plain.arrow needle
+{"path":"plain.arrow","column":"note","row":4,"value":"needle\nline"}
+```
+
+Many more, each with its real output on the test files in this
+repository: **[EXAMPLES.md](EXAMPLES.md)**.
+
 ## Results
 
 20 million rows of log data (2.3 GB of strings: `host`, `path`, `level`
@@ -391,6 +420,7 @@ CI (`.github/workflows/ci.yml`) runs all of it on Linux and macOS.
 
 ## More
 
+- [EXAMPLES.md](EXAMPLES.md): every option, with real output.
 - [ARCHITECTURE.md](ARCHITECTURE.md): how the code works, from the Arrow
   reader to the SIMD loop.
 - [CHANGELOG.md](CHANGELOG.md).
