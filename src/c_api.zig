@@ -4,7 +4,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const search = @import("search.zig");
-const Regex = @import("regex.zig").Regex;
+const Regex = @import("re.zig").Regex;
 
 const FDS_IGNORE_CASE = 1;
 const FDS_REGEX = 2;

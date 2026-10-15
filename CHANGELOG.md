@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **Optional PCRE2 regex engine:** `zig build -Dpcre2` runs `-E` with
+  PCRE2 and its JIT (`third_party/pcre2`, a git submodule, BSD) instead of
+  fds's Pike VM. Same matches, behind the same SIMD prefilter; 1.2–4×
+  faster on the Arrow log benchmark, 1.1–2.7× on Parquet
+  (`bench/regex.sh`). Full PCRE2 syntax in byte mode. Backtracking is
+  bounded per value; a value that hits the bound fails its file's search
+  (exit 2). `fds -V` names the engine; compile errors print PCRE2's
+  message.
 - **Exit status as in grep:** 0 if something matched, 1 if nothing did, 2
   on any error.
 - `-l` / `--files-with-matches`, `--count` (`path:column:count`) and

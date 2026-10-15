@@ -24,6 +24,8 @@ Parquet readers, to the SIMD loop that finds a term in a string column.
 | `src/zstd.zig` | zstd, through the reference decoder in `third_party/zstd` |
 | `src/match.zig` | Finding the term in a string array (SIMD), with no I/O; naive reference and randomized test |
 | `src/regex.zig` | `-E`: regex parser, compiler and Pike VM, behind the SIMD search as a prefilter |
+| `src/pcre2.zig` | `-E` through PCRE2 (`third_party/pcre2`, only with `-Dpcre2`), same interface as `regex.zig` |
+| `src/re.zig` | Picks the `-E` engine at build time: `regex.zig` or `pcre2.zig` |
 | `src/pattern.zig` | The command line's terms (`-e`, `-w`, `-S`, `-E`) into literals or one regex |
 | `src/c_api.zig` | C ABI (`include/fds.h`): `fds_search` with a callback, over `search.run` |
 | `src/bench_match.zig` | Matcher microbenchmark (`zig build bench-match`) |
@@ -444,6 +446,29 @@ run in parallel and the VM is not shared.
 against a backtracking matcher, asserting that every match contains the
 required literal (so the prefilter never drops one); and a check that the
 prefiltered and every-value paths agree on a column.
+
+### PCRE2 (`-Dpcre2`, `src/pcre2.zig`)
+
+With `zig build -Dpcre2`, `re.zig` swaps `regex.zig` for `pcre2.zig`,
+which has the same interface (`Regex`, `Vm`, `findValues`, `matches`,
+`span`), so the searchers don't know which engine runs. `build.zig`
+compiles PCRE2's 8-bit library and its JIT (sljit) from the release's
+generic files, always optimized, like zstd.
+
+- **Byte mode:** no UTF, `DOTALL` and `DOLLAR_ENDONLY`, ASCII tables, so
+  `.`, `$`, `\d \w \s \b` and `-i` mean what they do in `regex.zig`.
+- **Prefilter:** the required literal still comes from `regex.zig`'s
+  parser, used only when it reads the pattern the same way PCRE2 does;
+  otherwise every value goes to PCRE2.
+- **Backtracking is bounded:** each match has a `match_limit` (10 M steps)
+  and a JIT stack. A value that reaches either sets `Vm.limit_hit`, and the
+  piece (or the plan, for a dictionary) fails with `error.RegexLimit`, so
+  an unknown result is never reported as "no match".
+- Each `Vm` owns its match data, match context and JIT stack; jobs don't
+  share them.
+
+On the benchmark (`bench/regex.sh`), PCRE2 is 1.2–4× faster than the Pike
+VM on Arrow and 1.1–2.7× on Parquet, with identical matches.
 
 ## Output and the C API
 

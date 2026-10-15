@@ -2,7 +2,8 @@ const std = @import("std");
 const build_options = @import("build_options");
 const search = @import("search.zig");
 const pattern = @import("pattern.zig");
-const Regex = @import("regex.zig").Regex;
+const re_engine = @import("re.zig");
+const Regex = re_engine.Regex;
 
 // Usage: fds [options] <path> <term>, or fds [options] -e <term>... <path>
 // (see `usage` for the options)
@@ -59,7 +60,7 @@ pub fn main(init: std.process.Init) !void {
             continue;
         }
         if (eql(a, "-V", "--version")) {
-            std.debug.print("fds {s}\n", .{build_options.version});
+            std.debug.print("fds {s}{s}\n", .{ build_options.version, if (re_engine.pcre2) " (regex: PCRE2)" else "" });
             std.process.exit(0);
         } else if (eql(a, "-h", "--help")) {
             usage(0);
@@ -116,7 +117,9 @@ pub fn main(init: std.process.Init) !void {
     const p = try pattern.build(arena, terms.items, flags);
     var re: ?Regex = null;
     if (p.regex) re = Regex.compile(gpa, p.source, p.ignore_case) catch |err| {
-        std.debug.print("fds: invalid regex: {t}\n", .{err});
+        if (re_engine.lastError()) |msg| {
+            std.debug.print("fds: invalid regex: {s}\n", .{msg});
+        } else std.debug.print("fds: invalid regex: {t}\n", .{err});
         std.process.exit(2);
     };
     defer if (re) |*r| r.deinit();
@@ -198,6 +201,8 @@ test {
     _ = @import("zstd.zig");
     _ = @import("match.zig");
     _ = @import("regex.zig");
+    _ = @import("re.zig");
+    if (re_engine.pcre2) _ = @import("pcre2.zig");
     _ = @import("search.zig");
     _ = @import("walk.zig");
 }

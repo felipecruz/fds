@@ -14,7 +14,8 @@ library may all change.
 
 It is a command-line tool and a C library, about 2,800 lines of Zig. The
 one piece of third-party code is zstd's reference decompressor, built from
-source with the rest (`third_party/`). Two ideas make it fast:
+source with the rest (`third_party/`); PCRE2 can be built in too, as an
+optional regex engine. Two ideas make it fast:
 
 1. **Threads:** one task per directory, and inside a file one per piece:
    about 8 MB of one string column.
@@ -85,6 +86,38 @@ threads each. DuckDB and polars read Parquet natively.
   only counts rows.
 
 The script is `bench/parquet.sh`; `bench/others.py` times DuckDB and polars.
+
+### Regex engines
+
+`-E` runs fds's own engine (a Pike VM: linear time, no dependencies) by
+default, or PCRE2 with its JIT when built with `zig build -Dpcre2`. Both
+sit behind the same SIMD literal prefilter and report the same matches.
+The same 20 million rows, warm page cache, 16 threads:
+
+| Pattern | Arrow: fds VM | Arrow: PCRE2 | Parquet: fds VM | Parquet: PCRE2 |
+|:---|---:|---:|---:|---:|
+| `timeout [a-z]+ token` | 265 ms | **93 ms** | 577 ms | **395 ms** |
+| `-w checkout` | 332 ms | **173 ms** | 670 ms | **501 ms** |
+| `\d{5}$` | 1,287 ms | **578 ms** | 1,213 ms | **770 ms** |
+| `[xz]{3}` (no match) | 504 ms | **144 ms** | 692 ms | **415 ms** |
+| `error\|fatal` | 1,520 ms | **384 ms** | 1,799 ms | **665 ms** |
+| `-i TIMEOUT \w+ TOKEN` | 261 ms | **104 ms** | 586 ms | **400 ms** |
+| `^/api/v[0-9]+/checkout/\d+$` | 103 ms | **84 ms** | 323 ms | **301 ms** |
+| `(fast\|slow) (queue\|cache)` | 835 ms | **223 ms** | 1,306 ms | **529 ms** |
+
+- **PCRE2 is 1.2–4× faster on Arrow** and 1.1–2.7× on Parquet, where
+  decompression takes a larger share of the time. It gains the most on
+  alternations and on patterns with no required literal, where most values
+  reach the regex engine.
+- **PCRE2 backtracks**, so a pattern like `(a+)+$` can take exponential
+  time on some values. Each match is bounded; a value that reaches the
+  bound fails the search of its file (exit status 2) instead of being
+  taken as not matching. fds's own engine has no such case.
+- PCRE2 accepts its full syntax (lazy quantifiers, lookaround,
+  backreferences), in byte mode with the same semantics for `.`, `$`,
+  `\d \w \s \b` and `-i` as fds's engine.
+
+The script is `bench/regex.sh` (results in `results/regex-*.md`).
 
 ## What gets searched
 
@@ -186,6 +219,10 @@ zig build                                                  # Zig 0.17
 library, which zstd's decoder needs for `malloc`. For a fully static
 binary with no runtime dependencies, build against musl:
 `zig build -Dtarget=x86_64-linux-musl` (about 10% slower on zstd files).
+
+`zig build -Dpcre2` runs `-E` with PCRE2 (`third_party/pcre2`, BSD) instead
+of fds's own regex engine: faster, with fuller syntax, but backtracking
+(see [Regex engines](#regex-engines)). `fds -V` says which engine a binary has.
 
 ## The C library
 

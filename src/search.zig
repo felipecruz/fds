@@ -15,7 +15,7 @@ const Io = std.Io;
 const Map = @import("map.zig").Map;
 const match = @import("match.zig");
 const parquet = @import("parquet.zig");
-const regex = @import("regex.zig");
+const regex = @import("re.zig");
 const search_arrow = @import("search_arrow.zig");
 const search_parquet = @import("search_parquet.zig");
 const walk = @import("walk.zig");
@@ -198,9 +198,13 @@ pub const Searcher = struct {
         defer for (f.pieces.items) |*p| p.deinit(s.gpa);
         // On an error, the pieces planned before it are still searched.
         const matcher: Matcher = .{ .opts = &s.opts, .vm = if (vm) |*v| v else null, .arena = arena };
-        const plan_err = switch (format) {
+        var plan_err: anyerror!void = switch (format) {
             .arrow => search_arrow.plan(&f, arena, matcher),
             .parquet => search_parquet.plan(&f, arena, matcher),
+        };
+        // A dictionary entry whose result is unknown may have skipped a page.
+        if (vm) |*v| if (regex.limitHit(v)) {
+            plan_err = error.RegexLimit;
         };
         if (f.pieces.items.len == 1) {
             s.runPiece(&f, &f.pieces.items[0]);
@@ -239,6 +243,10 @@ pub const Searcher = struct {
         result catch |err| switch (err) {
             error.Enough => {}, // the piece found all the matches it may report
             else => piece.err = err,
+        };
+        // PCRE2 gave up on a value: whether it matched is unknown.
+        if (vm) |*v| if (piece.err == null and regex.limitHit(v)) {
+            piece.err = error.RegexLimit;
         };
     }
 
