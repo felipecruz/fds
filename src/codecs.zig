@@ -4,13 +4,15 @@
 //! state anything, so the size is treated as a claim. Nothing is allocated
 //! for it beyond what the compressed bytes could produce: LZ4 and Snappy
 //! have a small maximum ratio, so a larger claim is rejected up front;
-//! zstd and gzip have none, so their output grows only as bytes come out,
-//! and stops one byte past the claim.
+//! zstd and gzip have none, so their output grows only as bytes come out
+//! (zstd: unless its own frame header agrees and the ratio is plausible;
+//! see zstd.zig), and stops one byte past the claim.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const lz4 = @import("lz4.zig");
 const snappy = @import("snappy.zig");
+const zstd = @import("zstd.zig");
 
 pub const Error = error{ Malformed, OutOfMemory };
 
@@ -48,12 +50,7 @@ pub fn decompress(arena: Allocator, codec: Codec, src: []const u8, n: usize) Err
             hadoopLz4(src, out) catch lz4.decompressBlock(src, out) catch return error.Malformed;
             return out;
         },
-        .zstd => {
-            var in: std.Io.Reader = .fixed(src);
-            // The whole output stays in memory, so any window size fits.
-            var d: std.compress.zstd.Decompress = .init(&in, &.{}, .{ .window_len = 1 << 30 });
-            return stream(arena, &d.reader, src.len, n, std.compress.zstd.block_size_max);
-        },
+        .zstd => return zstd.decompress(arena, src, n), // the reference decoder, third_party/zstd
         .gzip => {
             var in: std.Io.Reader = .fixed(src);
             var d: std.compress.flate.Decompress = .init(&in, .gzip, &.{});

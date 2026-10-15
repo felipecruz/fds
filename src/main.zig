@@ -128,6 +128,7 @@ test {
     _ = @import("parquet.zig");
     _ = @import("snappy.zig");
     _ = @import("thrift.zig");
+    _ = @import("zstd.zig");
     _ = @import("match.zig");
     _ = @import("regex.zig");
     _ = @import("search.zig");

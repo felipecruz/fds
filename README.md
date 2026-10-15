@@ -12,8 +12,9 @@ term, and it prints every matching value with its file, column and row.
 `.arrows`) and Parquet (`.parquet`). The command line, the output and the C
 library may all change.
 
-It is a command-line tool and a C library, about 2,800 lines of Zig with
-no dependencies. Two ideas make it fast:
+It is a command-line tool and a C library, about 2,800 lines of Zig. The
+one piece of third-party code is zstd's reference decompressor, built from
+source with the rest (`third_party/`). Two ideas make it fast:
 
 1. **Threads:** one task per directory, and inside a file one per piece:
    about 8 MB of one string column.
@@ -75,12 +76,13 @@ threads each. DuckDB and polars read Parquet natively.
 |:---|---:|---:|---:|
 | pyarrow defaults: Snappy, dictionaries (707 MB) | **275 ms** | 324 ms | 470 ms |
 | No dictionaries, plain pages (792 MB) | **335 ms** | 459 ms | 583 ms |
-| zstd (535 MB) | 1,907 ms | **406 ms** | 593 ms |
+| zstd (535 MB) | **321 ms** | 406 ms | 593 ms |
 
-- With Snappy, fds is level with DuckDB on rare terms (302 ms against
-  346 ms) and common ones (459 ms against 480 ms).
-- **zstd is slow**: Zig's standard-library decoder runs at about 175 MB/s
-  per core, against about 1,550 MB/s for the reference C library.
+- Rare terms: 302 ms with Snappy (DuckDB 346 ms), 344 ms with zstd
+  (DuckDB 466 ms).
+- Common terms are about even: 459 ms with Snappy and 479 ms with zstd,
+  against DuckDB's 480 ms and 465 ms. fds prints every match; DuckDB
+  only counts rows.
 
 The script is `bench/parquet.sh`; `bench/others.py` times DuckDB and polars.
 
@@ -138,9 +140,22 @@ data/events.arrow:m[].value:0:needle
 - `^` and `$` match at the start and end of the value. In `--content`
   output, newlines in values are printed as `\n`.
 
-`zig build` puts the binary in `zig-out/release/fds`.
+## Building
 
-From C:
+```
+git clone --recursive https://github.com/felipecruz/fds   # or: git submodule update --init
+zig build                                                  # Zig 0.17
+```
+
+`zig build` puts the binary in `zig-out/release/fds` (and a debug build in
+`zig-out/debug/fds`, `libfds.a` in `zig-out/lib`). It links the system C
+library, which zstd's decoder needs for `malloc`. For a fully static
+binary with no runtime dependencies, build against musl:
+`zig build -Dtarget=x86_64-linux-musl` (about 10% slower on zstd files).
+
+## The C library
+
+`libfds.a` includes zstd, so a C program links just it (and libc):
 
 ```c
 #include <stdio.h>
@@ -162,8 +177,8 @@ fds_search("data", "needle", FDS_IGNORE_CASE, 0, on_match, NULL);
   IPC stream format (`.arrows`), including old streams without the
   continuation marker.
 - Buffers compressed with LZ4 frame (what pyarrow's `write_feather` uses
-  by default) or zstd. Both decoders are built in: LZ4 is about 90 lines
-  in `src/lz4.zig`, zstd comes from Zig's standard library.
+  by default) or zstd. LZ4 is built in (`src/lz4.zig`); zstd is the
+  reference decoder (`third_party/zstd`).
 - Dictionary batches, including deltas and (in streams) replacements.
 - Not supported: Feather v1 (2016) and big-endian files. Such files are
   reported on stderr and skipped.
@@ -176,8 +191,9 @@ and compat levels), Arrow JS, and the Hugging Face `datasets` cache
 **Parquet:**
 
 - Codecs: uncompressed, Snappy, gzip, zstd, LZ4 (`LZ4_RAW` and the older
-  Hadoop-framed `LZ4`). Snappy and LZ4 decoders are built in; zstd and
-  gzip come from Zig's standard library. Not supported: LZO and Brotli.
+  Hadoop-framed `LZ4`). Snappy and LZ4 decoders are built in, zstd is the
+  reference decoder, gzip comes from Zig's standard library. Not
+  supported: LZO and Brotli.
 - Data pages v1 and v2; string encodings `PLAIN`, `RLE_DICTIONARY` /
   `PLAIN_DICTIONARY`, `DELTA_LENGTH_BYTE_ARRAY` and `DELTA_BYTE_ARRAY`.
 - Not supported: encrypted files, and columns stored in other files.
@@ -202,9 +218,9 @@ produce.
 - **ASCII semantics.** `-i`, `\w` and `\b` are ASCII-only.
 - **String views** are searched one value at a time, because their bytes
   are not stored back to back. That is slower than `utf8` columns.
-- **Parquet:** strings inside lists and maps are not searched yet. zstd
-  files are slow (see Results). A column chunk is searched by one thread,
-  so a file with fewer chunks than threads doesn't use them all.
+- **Parquet:** strings inside lists and maps are not searched yet. A
+  column chunk is searched by one thread, so a file with fewer chunks than
+  threads doesn't use them all.
 - **Parquet pages are capped at 16 M values**, far above what writers
   produce, so that a corrupted header can't make fds allocate without
   bound. A larger page is reported as unsupported.

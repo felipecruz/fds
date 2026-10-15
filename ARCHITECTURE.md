@@ -21,6 +21,7 @@ Parquet readers, to the SIMD loop that finds a term in a string column.
 | `src/codecs.zig` | Every codec behind one call, with allocation limits |
 | `src/lz4.zig` | LZ4 frames and blocks |
 | `src/snappy.zig` | Snappy blocks |
+| `src/zstd.zig` | zstd, through the reference decoder in `third_party/zstd` |
 | `src/match.zig` | Finding the term in a string array (SIMD), with no I/O; naive reference and randomized test |
 | `src/regex.zig` | `-E`: regex parser, compiler and Pike VM, behind the SIMD search as a prefilter |
 | `src/c_api.zig` | C ABI (`include/fds.h`): `fds_search` with a callback, over `search.run` |
@@ -304,10 +305,24 @@ could produce:
 Before this rule, a 7.6 KB corrupted Arrow file could make fds allocate
 48 GB (`testdata/mutate.py` found it).
 
-The Snappy and LZ4 decoders are built in (`snappy.zig`, `lz4.zig`). zstd
-and gzip are Zig's standard library. Its zstd decoder is correct but slow,
-about 175 MB/s per core against about 1,550 MB/s for the reference C
-library, which is why zstd Parquet files are slow.
+The Snappy and LZ4 decoders are built in (`snappy.zig`, `lz4.zig`), and
+gzip is Zig's standard library.
+
+**zstd** is the reference decoder, a git submodule in `third_party/zstd`
+pinned to a release. `build.zig` compiles only its decompressor
+(`lib/common`, `lib/decompress`, plus its x86-64 assembly Huffman decoder),
+always optimized, into the binary and into `libfds.a`. `zstd.zig` declares
+the few C functions it calls. Zig's standard-library decoder is correct
+but ran at about 175 MB/s per core, against about 1,550 MB/s for the
+reference one. On the benchmark, that took zstd Parquet from 1.9 s to
+0.32 s.
+
+zstd allocates with `malloc`, so `fds` links the C library: glibc by
+default (a dynamic binary), or musl with `-Dtarget=x86_64-linux-musl` for a
+static one. `zstd.decompress` keeps the rule above: it allocates the
+claimed size up front only when the frame header states the same size and
+the ratio is at most 64×; otherwise it streams, growing the output as it
+comes.
 
 ## The SIMD loop (`src/match.zig`)
 

@@ -14,6 +14,12 @@
   for every codec.
 - `search.zig` is split: the generic layer, plus `search_arrow.zig` and
   `search_parquet.zig`.
+- zstd now uses the reference decoder, vendored as a git submodule in
+  `third_party/zstd` (v1.5.7, BSD) and compiled from source into `fds` and
+  `libfds.a`: about 9× faster than Zig's standard-library decoder. zstd
+  Parquet: 1.9 s → 0.32 s on the benchmark (DuckDB: 0.41 s). `fds` now
+  links the C library (glibc by default; musl for a static binary). Clone
+  with `--recursive`.
 - Fixed: files written by polars (`write_ipc`) were rejected as malformed.
   IPC files are now read through their footer, as other readers do.
 - Fixed: a corrupted compressed buffer could make fds allocate as much
