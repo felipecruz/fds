@@ -11,7 +11,8 @@ test files, and review the diff.
 
 With --check, nothing is written: it fails if any example's output
 differs from what the page shows. Lines are compared as sets, since files
-in a directory come out in no fixed order.
+in a directory come out in no fixed order, and with runs of spaces
+collapsed, since other tools pad differently (`uniq -c` on macOS).
 """
 
 import difflib
@@ -49,6 +50,10 @@ def examples(body):
     return out
 
 
+def normal(lines):
+    return sorted(" ".join(line.split()) for line in lines)
+
+
 def main():
     check = "--check" in sys.argv[1:]
     pages = [os.path.join(ROOT, "README.md")] + sorted(glob.glob(os.path.join(ROOT, "docs", "*.md")))
@@ -63,7 +68,7 @@ def main():
             lines = []
             for cmd, shown in examples(m.group(2)):
                 got = run(cmd, info.strip())
-                if check and sorted(got) != sorted(shown):
+                if check and normal(got) != normal(shown):
                     failed += 1
                     print(f"{name}: $ {cmd}")
                     sys.stdout.writelines(difflib.unified_diff(
