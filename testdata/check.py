@@ -5,7 +5,9 @@ Usage: python3 testdata/check.py <fds binary> <path> <term> [-i]   (needs pyarro
 Reads every .arrow, .feather, .arrows and .parquet file under <path> (or
 <path> itself) with pyarrow, finds the values containing <term> with the same
 reference search as fuzz.py, and checks that `fds` prints exactly those
-matches. Files pyarrow can't read must be reported by fds, not searched.
+matches. Files pyarrow can't read must be reported by fds, not searched,
+and so must strings fds can't search (in unions, run-end-encoded arrays
+and list views).
 """
 
 import os
@@ -17,7 +19,7 @@ import pyarrow.ipc as ipc
 import pyarrow.parquet as pq
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from fuzz import ascii_lower, hits  # noqa: E402
+from fuzz import ascii_lower, hits, is_string  # noqa: E402
 
 EXTENSIONS = (".arrow", ".feather", ".arrows", ".parquet")
 
@@ -43,8 +45,31 @@ def read(path):
     return ipc.open_stream(path).read_all()
 
 
+def has_strings(t):
+    if is_string(t):
+        return True
+    return any(has_strings(t.field(i).type) for i in range(t.num_fields))
+
+
+def unsearched(name, t):
+    """Column paths under `name` whose strings fds reports as not searched,
+    named as fds names them."""
+    if is_string(t):
+        return []
+    if pa.types.is_struct(t):
+        return [c for f in t for c in unsearched(f"{name}.{f.name}", f.type)]
+    if pa.types.is_map(t):
+        return unsearched(f"{name}[].key", t.key_type) + unsearched(f"{name}[].value", t.item_type)
+    if pa.types.is_list(t) or pa.types.is_large_list(t) or pa.types.is_fixed_size_list(t):
+        return unsearched(f"{name}[]", t.value_type)
+    if (pa.types.is_union(t) or pa.types.is_run_end_encoded(t) or pa.types.is_list_view(t)
+            or pa.types.is_large_list_view(t)):
+        return [name] if has_strings(t) else []
+    return []
+
+
 def expected_matches(root, term, fold):
-    expected, bad, rows_total = set(), [], 0
+    expected, bad, rows_total, warnings = set(), [], 0, set()
     for path in arrow_files(root):
         try:
             table = read(path)
@@ -55,22 +80,26 @@ def expected_matches(root, term, fold):
         needle = ascii_lower(term) if fold else term
         # Paths as fds prints them: "<root>/<relative path>", or the root.
         shown = path if os.path.isfile(root) else root.rstrip("/") + "/" + os.path.relpath(path, root)
+        for f in table.schema:
+            for col in unsearched(f.name, f.type):
+                warnings.add(f"fds: {shown}: column {col} not searched")
         for row_index, row in enumerate(table.to_pylist()):
             for f in table.schema:
                 for col in hits(f.name, f.type, row[f.name], needle, fold):
                     expected.add(f"{shown}:{col}:{row_index}")
-    return expected, bad, rows_total
+    return expected, bad, rows_total, warnings
 
 
 def main():
     fds, root, term = sys.argv[1:4]
     fold = "-i" in sys.argv[4:]
-    expected, bad, rows = expected_matches(root, term, fold)
+    expected, bad, rows, warnings = expected_matches(root, term, fold)
     out = subprocess.run([fds] + (["-i"] if fold else []) + [root, term], capture_output=True, text=True)
     got = set(out.stdout.splitlines())
     reported = out.stderr.splitlines()
-    # Exit status: 2 if any file was unreadable, else 0 with matches, else 1.
-    want_status = 2 if bad else (0 if expected else 1)
+    # Exit status: 2 if any file was unreadable or any strings unsearched,
+    # else 0 with matches, else 1.
+    want_status = 2 if bad or warnings else (0 if expected else 1)
     ok = got == expected and out.returncode == want_status
     if out.returncode != want_status:
         print(f"exit status {out.returncode}, expected {want_status}")
@@ -78,13 +107,17 @@ def main():
         if not any(line.startswith(f"fds: {path}") or path in line for line in reported):
             print(f"not reported by fds: {path} ({why})")
             ok = False
+    for w in warnings:
+        if not any(line.startswith(w) for line in reported):
+            print(f"not reported by fds: {w}")
+            ok = False
     bad_paths = {path for path, _ in bad}
     for line in reported:
-        if not any(p in line for p in bad_paths):
+        if not any(p in line for p in bad_paths) and not any(line.startswith(w) for w in warnings):
             print(f"fds reported a file pyarrow reads: {line}")
             ok = False
     print(f"{len(list(arrow_files(root)))} files, {rows} rows, {len(expected)} matches, "
-          f"{len(bad)} unreadable: " + ("fds agrees" if ok else "MISMATCH"))
+          f"{len(bad)} unreadable, {len(warnings)} columns not searched: " + ("fds agrees" if ok else "MISMATCH"))
     if not ok:
         print("missing:", sorted(expected - got)[:10])
         print("extra:", sorted(got - expected)[:10])
