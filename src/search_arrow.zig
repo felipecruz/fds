@@ -115,7 +115,7 @@ pub const Job = struct {
         for (t.path, levels) |field, *l| l.* = try b.batch.level(arena, field, b.columns[field.index]);
         const cursors = try arena.alloc(usize, t.path.len);
         @memset(cursors, 0);
-        var sink: Sink = .{ .f = f, .piece = piece, .first_row = b.first_row, .levels = levels, .cursors = cursors };
+        var sink: Sink = .{ .f = f, .piece = piece, .matcher = matcher, .first_row = b.first_row, .levels = levels, .cursors = cursors };
 
         const col = b.columns[t.leaf.index];
         if (t.leaf.dict) |d| {
@@ -263,6 +263,7 @@ fn findStrings(m: Matcher, strings: arrow.Strings, sink: anytype) !void {
 const Sink = struct {
     f: *const FileSearch,
     piece: *Piece,
+    matcher: Matcher,
     first_row: u64,
     levels: []const arrow.Level,
     cursors: []usize,
@@ -279,6 +280,6 @@ const Sink = struct {
             level -= 1;
             j = k.levels[level].parent(j, &k.cursors[level]) orelse return;
         }
-        try k.piece.record(k.f, k.first_row + j, value);
+        try k.piece.record(k.f, k.matcher, k.first_row + j, value);
     }
 };

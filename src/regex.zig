@@ -493,6 +493,45 @@ pub const Vm = struct {
         }
     }
 
+    // Like `add`, but follows every path even after reaching `match`, so
+    // `longestAt` keeps the threads that may match longer. Returns true if
+    // any path reaches `match`.
+    fn addAll(vm: *Vm, re: *const Regex, list: []u32, n: *usize, start: u32, line: []const u8, i: usize) bool {
+        var matched = false;
+        var sp: usize = 1;
+        vm.stack[0] = start;
+        while (sp > 0) {
+            sp -= 1;
+            const pc = vm.stack[sp];
+            if (vm.seen[pc] == vm.gen) continue;
+            vm.seen[pc] = vm.gen;
+            const follow = switch (re.prog[pc]) {
+                .match => {
+                    matched = true;
+                    continue;
+                },
+                .set => {
+                    list[n.*] = pc;
+                    n.* += 1;
+                    continue;
+                },
+                .jmp => |t| t,
+                .split => |t| {
+                    vm.stack[sp] = t[1];
+                    vm.stack[sp + 1] = t[0];
+                    sp += 2;
+                    continue;
+                },
+                .bol => if (i == 0) pc + 1 else continue,
+                .eol => if (i == line.len) pc + 1 else continue,
+                .word_boundary => if (wordBoundary(line, i)) pc + 1 else continue,
+            };
+            vm.stack[sp] = follow;
+            sp += 1;
+        }
+        return matched;
+    }
+
     // Adds the thread at `start` and everything reachable from it without
     // consuming a byte. Returns true if that reaches `match`.
     fn add(vm: *Vm, re: *const Regex, list: []u32, n: *usize, start: u32, line: []const u8, i: usize) bool {
@@ -527,6 +566,42 @@ pub const Vm = struct {
         return false;
     }
 };
+
+/// The leftmost match in `line` at or after `from`, as [start, end), taking
+/// the longest end at that start. For highlighting a value already known
+/// to match, so it trades speed for simplicity: one anchored run per
+/// candidate start.
+pub fn span(vm: *Vm, re: *const Regex, line: []const u8, from: usize) ?[2]usize {
+    var start = from;
+    while (start <= line.len) : (start += 1) {
+        if (re.first) |first| {
+            while (start < line.len and !first.isSet(line[start])) start += 1;
+            if (start == line.len) return null;
+        }
+        if (longestAt(vm, re, line, start)) |end| return .{ start, end };
+        if (isAnchored(re)) return null;
+    }
+    return null;
+}
+
+// The end of the longest match starting exactly at `start`, if any.
+fn longestAt(vm: *Vm, re: *const Regex, line: []const u8, start: usize) ?usize {
+    var best: ?usize = null;
+    var n_cur: usize = 0;
+    vm.gen += 1;
+    if (vm.addAll(re, vm.clist, &n_cur, 0, line, start)) best = start;
+    var i = start;
+    while (n_cur > 0 and i < line.len) : (i += 1) {
+        vm.gen += 1;
+        var n_next: usize = 0;
+        for (vm.clist[0..n_cur]) |pc| {
+            if (re.prog[pc].set.isSet(line[i]) and vm.addAll(re, vm.nlist, &n_next, pc + 1, line, i + 1)) best = i + 1;
+        }
+        std.mem.swap([]u32, &vm.clist, &vm.nlist);
+        n_cur = n_next;
+    }
+    return best;
+}
 
 // A pattern starting with '^' can't match once all threads have died.
 fn isAnchored(re: *const Regex) bool {
@@ -818,5 +893,24 @@ test "regex findValues: prefiltered and every-value paths agree" {
             const expected = std.mem.indexOfScalar(usize, c[2], row) != null;
             try testing.expectEqual(expected, matches(&re, &vm, v));
         }
+    }
+}
+
+test "span: leftmost match, longest end" {
+    const gpa = testing.allocator;
+    const cases = [_]struct { []const u8, []const u8, ?[2]usize }{
+        .{ "ab+", "xxabbbyab", .{ 2, 6 } },
+        .{ "\\bneedle\\b", "needles a needle", .{ 10, 16 } },
+        .{ "a|ab", "zab", .{ 1, 3 } },
+        .{ "^b", "ab", null },
+        .{ "x*", "abc", .{ 0, 0 } },
+        .{ "c$", "abc", .{ 2, 3 } },
+    };
+    for (cases) |c| {
+        var re = try Regex.compile(gpa, c[0], false);
+        defer re.deinit();
+        var vm = try Vm.init(gpa, &re);
+        defer vm.deinit(gpa);
+        try testing.expectEqual(c[2], span(&vm, &re, c[1], 0));
     }
 }

@@ -106,15 +106,28 @@ Not yet: strings inside lists and maps.
 ## Usage
 
 ```
-fds [-j N|auto] [-i] [-E] [-c COLUMN]... [--content] <path> <term>
+fds [options] <path> <term>
+fds [options] -e <term> [-e <term>]... <path>
 
-  -j N|auto          worker threads (default: auto = all CPUs; performance
-                     cores on Apple silicon)
-  -i, --ignore-case  ASCII case-insensitive
-  -E, --regex        <term> is a regex: . [a-z] [^0-9] \d \w \s \b ^ $ * + ? {n,m} | ( ) \n
-  -c, --column NAME  search only this column: a top-level name, or a path
-                     like user.name or tags[]; repeatable
-  --content          print path:column:row:value instead of path:column:row
+matching:
+  -i, --ignore-case    ASCII case-insensitive
+  -S, --smart-case     ignore case unless a term has an upper-case letter
+  -E, --regex          terms are regexes: . [a-z] [^0-9] \d \w \s \b ^ $ * + ? {n,m} | ( ) \n
+  -w, --word           whole words only
+  -e, --regexp TERM    a term; repeat to match any of several
+  -c, --column NAME    search only this column: a top-level name, or a path
+                       like user.name or tags[]; repeatable
+output:
+  --content            print path:column:row:value instead of path:column:row
+  -l, --files-with-matches   print only the files that match
+  --count              print path:column:count for each column with matches
+  -m, --max-count N    stop after N matches in each file
+  --json               JSON Lines (see below)
+  --color WHEN         auto (default: a terminal, unless NO_COLOR is set),
+                       always or never
+other:
+  -j N|auto            worker threads (default: auto = all CPUs; performance
+                       cores on Apple silicon)
 ```
 
 `<path>` is a directory (every `.arrow`, `.feather`, `.arrows` and
@@ -136,9 +149,30 @@ data/events.arrow:m[].value:0:needle
   `tags[]`, and map keys and values are `m[].key` and `m[].value`. A row
   whose list holds several matches is reported once.
 - **Order:** files come out in no fixed order. Within a file, matches are
-  ordered by record batch, then column, then row.
+  ordered by record batch, then column, then row; `-m N` keeps the file's
+  first N in that order.
 - `^` and `$` match at the start and end of the value. In `--content`
-  output, newlines in values are printed as `\n`.
+  output, newlines in values are printed as `\n`. On a terminal, paths,
+  columns, rows and the matched text are colored, as in ripgrep.
+- **Exit status**, as in grep: 0 if something matched, 1 if nothing did,
+  2 if a file couldn't be read (even if others matched).
+
+**`--json`** prints one object per line, ready for `jq` or
+`pandas.read_json(..., lines=True)`:
+
+```
+{"path":"data/events.arrow","column":"note","row":4,"value":"needle\nline"}
+```
+
+A value (or path) that isn't valid UTF-8 is given as `"value_base64"`
+instead, since JSON strings can't hold arbitrary bytes. With `-l`, the
+objects are `{"path"}`; with `--count`, `{"path","column","count"}`.
+
+**Speed of the modes**, `checkout` in the 2.3 GB Arrow file (4.4 M
+matches): printing them all 150 ms, `--count` 68 ms, `-m 1` 21 ms, `-l`
+5 ms (it stops at the first match). `-e a -e b` searches each literal with
+the SIMD loop (272 ms for two); `-w` and `-E` alternations run the regex
+engine on candidate values.
 
 ## Building
 

@@ -1,9 +1,11 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const search = @import("search.zig");
+const pattern = @import("pattern.zig");
 const Regex = @import("regex.zig").Regex;
 
-// Usage: fds [-j N] [-i] [-E] [-c COLUMN]... [--content] <path> <term>
+// Usage: fds [options] <path> <term>, or fds [options] -e <term>... <path>
+// (see `usage` for the options)
 // Recursively searches every Arrow IPC file (.arrow, .feather, .arrows)
 // and Parquet file (.parquet) under <path>, or <path> itself if it is a
 // file, and prints `path:column:row` (or `path:column:row:value` with
@@ -38,84 +40,148 @@ pub fn main(init: std.process.Init) !void {
 
     const args = try init.minimal.args.toSlice(arena);
     var jobs: usize = 0; // 0: automatic
-    var content = false;
-    var ignore_case = false;
-    var use_regex = false;
+    var print: search.Print = .{ .file = .stdout() };
+    var color: enum { auto, always, never } = .auto;
+    var flags: pattern.Flags = .{};
+    var max_count: ?u64 = null;
+    var terms: std.ArrayList([]const u8) = .empty; // from -e
     var columns: std.ArrayList([]const u8) = .empty;
-    var pos_args = args[1..];
-    while (pos_args.len > 0 and std.mem.startsWith(u8, pos_args[0], "-")) {
-        const flag = pos_args[0];
-        pos_args = pos_args[1..];
-        if (std.mem.eql(u8, flag, "--version") or std.mem.eql(u8, flag, "-V")) {
+    var pos: std.ArrayList([]const u8) = .empty;
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--")) { // the rest are operands
+            try pos.appendSlice(arena, args[i + 1 ..]);
+            break;
+        }
+        if (a.len < 2 or a[0] != '-') {
+            try pos.append(arena, a);
+            continue;
+        }
+        if (eql(a, "-V", "--version")) {
             std.debug.print("fds {s}\n", .{build_options.version});
             std.process.exit(0);
-        } else if (std.mem.eql(u8, flag, "--content")) {
-            content = true;
-        } else if (std.mem.eql(u8, flag, "-i") or std.mem.eql(u8, flag, "--ignore-case")) {
-            ignore_case = true;
-        } else if (std.mem.eql(u8, flag, "-E") or std.mem.eql(u8, flag, "--regex")) {
-            use_regex = true;
-        } else if (std.mem.eql(u8, flag, "-c") or std.mem.eql(u8, flag, "--column")) {
-            if (pos_args.len == 0) usage();
-            try columns.append(arena, pos_args[0]);
-            pos_args = pos_args[1..];
-        } else if (std.mem.startsWith(u8, flag, "-j")) {
-            var value: []const u8 = flag[2..];
-            if (value.len == 0) {
-                if (pos_args.len == 0) usage();
-                value = pos_args[0];
-                pos_args = pos_args[1..];
-            }
-            if (std.mem.eql(u8, value, "auto")) {
-                jobs = 0;
-            } else {
-                jobs = std.fmt.parseInt(usize, value, 10) catch usage();
-                if (jobs == 0) usage();
-            }
-        } else usage();
+        } else if (eql(a, "-h", "--help")) {
+            usage(0);
+        } else if (eql(a, "--content", null)) {
+            print.content = true;
+        } else if (eql(a, "-i", "--ignore-case")) {
+            flags.ignore_case = true;
+        } else if (eql(a, "-S", "--smart-case")) {
+            flags.smart_case = true;
+        } else if (eql(a, "-E", "--regex")) {
+            flags.regex = true;
+        } else if (eql(a, "-w", "--word")) {
+            flags.word = true;
+        } else if (eql(a, "-l", "--files-with-matches")) {
+            print.mode = .files_with_matches;
+        } else if (eql(a, "--count", null)) {
+            print.mode = .count;
+        } else if (eql(a, "--json", null)) {
+            print.json = true;
+        } else if (eql(a, "-e", "--regexp")) {
+            try terms.append(arena, value(args, &i));
+        } else if (eql(a, "-c", "--column")) {
+            try columns.append(arena, value(args, &i));
+        } else if (eql(a, "-m", "--max-count")) {
+            max_count = std.fmt.parseInt(u64, value(args, &i), 10) catch usage(2);
+        } else if (std.mem.startsWith(u8, a, "--color")) {
+            const v = if (std.mem.startsWith(u8, a, "--color=")) a["--color=".len..] else value(args, &i);
+            color = std.meta.stringToEnum(@TypeOf(color), v) orelse usage(2);
+        } else if (std.mem.startsWith(u8, a, "-j")) {
+            const v = if (a.len > 2) a[2..] else value(args, &i);
+            jobs = if (std.mem.eql(u8, v, "auto")) 0 else std.fmt.parseInt(usize, v, 10) catch usage(2);
+            if (jobs == 0 and !std.mem.eql(u8, v, "auto")) usage(2);
+        } else usage(2);
     }
-    if (pos_args.len != 2 or pos_args[1].len == 0) usage();
-    const root_path = pos_args[0];
-    const term = pos_args[1];
 
+    // `fds <path> <term>`, or `fds -e <term>... <path>`.
+    if (terms.items.len == 0) {
+        if (pos.items.len != 2) usage(2);
+        try terms.append(arena, pos.items[1]);
+    } else if (pos.items.len != 1) usage(2);
+    const root_path = pos.items[0];
+    for (terms.items) |t| if (t.len == 0) usage(2);
+
+    print.color = switch (color) {
+        .always => true,
+        .never => false,
+        // A terminal, unless NO_COLOR is set (https://no-color.org) or
+        // TERM says it can't.
+        .auto => !print.json and (print.file.isTty(init.io) catch false) and
+            init.environ_map.get("NO_COLOR") == null and
+            !std.mem.eql(u8, init.environ_map.get("TERM") orelse "", "dumb"),
+    };
+
+    const p = try pattern.build(arena, terms.items, flags);
     var re: ?Regex = null;
-    if (use_regex) re = Regex.compile(gpa, term, ignore_case) catch |err| {
+    if (p.regex) re = Regex.compile(gpa, p.source, p.ignore_case) catch |err| {
         std.debug.print("fds: invalid regex: {t}\n", .{err});
         std.process.exit(2);
     };
     defer if (re) |*r| r.deinit();
 
-    search.run(gpa, .{
+    const summary = search.run(gpa, .{
         .root_path = root_path,
-        .term = term,
+        .term = p.source,
+        .terms = if (p.literals.len > 1) p.literals else &.{},
         .jobs = if (jobs == 0) search.autoJobs() else jobs,
-        .ignore_case = ignore_case,
+        .ignore_case = p.ignore_case,
         .regex = if (re) |*r| r else null,
         .columns = columns.items,
-    }, .{ .print = .{ .file = .stdout(), .content = content } }) catch |err| {
+        .max_count = max_count,
+    }, .{ .print = print }) catch |err| {
         std.debug.print("fds: {s}: {t}\n", .{ root_path, err });
         std.process.exit(2);
     };
+    // As grep: 0 if something matched, 1 if nothing did, 2 on any error.
+    std.process.exit(if (summary.errors) 2 else if (summary.matched) 0 else 1);
 }
 
-fn usage() noreturn {
+fn eql(a: []const u8, short: []const u8, long: ?[]const u8) bool {
+    return std.mem.eql(u8, a, short) or (long != null and std.mem.eql(u8, a, long.?));
+}
+
+// The value of the option at args[i.*], which is the next argument.
+fn value(args: []const [:0]const u8, i: *usize) []const u8 {
+    i.* += 1;
+    if (i.* >= args.len) usage(2);
+    return args[i.*];
+}
+
+fn usage(status: u8) noreturn {
     std.debug.print(
-        \\usage: fds [-j N|auto] [-i] [-E] [-c COLUMN]... [--content] <path> <term>
+        \\usage: fds [options] <path> <term>
+        \\       fds [options] -e <term> [-e <term>]... <path>
         \\  Searches the string values of every .arrow, .feather, .arrows and
         \\  .parquet file under <path> (or the file <path>), printing
-        \\  <path>:<column>:<row>.
-        \\  -j N|auto          worker threads (default: auto = {d} here, the
-        \\                     performance-core count on Apple silicon, else all CPUs)
-        \\  -i, --ignore-case  match ASCII letters regardless of case
-        \\  -E, --regex        <term> is a regular expression (see src/regex.zig)
-        \\  -c, --column NAME  search only this column (a top-level name or a
-        \\                     path like user.name or tags[]); repeatable
-        \\  --content          also print the value: <path>:<column>:<row>:<value>
-        \\                     (newlines in it as \n)
-        \\  -V, --version      print the version
+        \\  <path>:<column>:<row> for each match.
+        \\
+        \\matching:
+        \\  -i, --ignore-case    match ASCII letters regardless of case
+        \\  -S, --smart-case     ignore case unless a term has an upper-case letter
+        \\  -E, --regex          terms are regular expressions (see src/regex.zig)
+        \\  -w, --word           match whole words only
+        \\  -e, --regexp TERM    a term to search for; repeat for any of several
+        \\  -c, --column NAME    search only this column (a top-level name or a
+        \\                       path like user.name or tags[]); repeatable
+        \\output:
+        \\  --content            also print the value: <path>:<column>:<row>:<value>
+        \\                       (newlines in it as \n)
+        \\  -l, --files-with-matches   print only the files that match
+        \\  --count              print <path>:<column>:<count> per matching column
+        \\  -m, --max-count N    stop after N matches in each file
+        \\  --json               JSON Lines: {{"path","column","row","value"}}
+        \\  --color WHEN         auto (a terminal; default), always or never
+        \\other:
+        \\  -j N|auto            worker threads (default: auto = {d} here, the
+        \\                       performance-core count on Apple silicon, else all CPUs)
+        \\  -V, --version        print the version
+        \\
+        \\Exit status: 0 if something matched, 1 if nothing did, 2 on an error.
         \\
     , .{search.autoJobs()});
-    std.process.exit(2);
+    std.process.exit(status);
 }
 
 test {
@@ -126,6 +192,7 @@ test {
     _ = @import("map.zig");
     _ = @import("codecs.zig");
     _ = @import("parquet.zig");
+    _ = @import("pattern.zig");
     _ = @import("snappy.zig");
     _ = @import("thrift.zig");
     _ = @import("zstd.zig");

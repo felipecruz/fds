@@ -24,6 +24,7 @@ Parquet readers, to the SIMD loop that finds a term in a string column.
 | `src/zstd.zig` | zstd, through the reference decoder in `third_party/zstd` |
 | `src/match.zig` | Finding the term in a string array (SIMD), with no I/O; naive reference and randomized test |
 | `src/regex.zig` | `-E`: regex parser, compiler and Pike VM, behind the SIMD search as a prefilter |
+| `src/pattern.zig` | The command line's terms (`-e`, `-w`, `-S`, `-E`) into literals or one regex |
 | `src/c_api.zig` | C ABI (`include/fds.h`): `fds_search` with a callback, over `search.run` |
 | `src/bench_match.zig` | Matcher microbenchmark (`zig build bench-match`) |
 
@@ -446,13 +447,41 @@ prefiltered and every-value paths agree on a column.
 
 ## Output and the C API
 
-The sink formats `path:column:row` (`--content` adds `:value`, with `\n`
-and `\r` escaped) into the job's buffer. For the C API it stores the
-value's bytes and position instead, and `report` turns each one into a
-`search.Hit`. `c_api.zig` copies a hit into one buffer as NUL-terminated
-`path`, `column` and `text` and calls the C callback. A nonzero return
-sets a flag that every job and the reporter check, so the search stops
-soon.
+Each piece records its own matches (`Piece.record`), in its own buffer,
+and `Searcher.report` writes a file's pieces in order under the output
+mutex. The output modes are decided in those two places:
+
+- **Matches** (the default): `record` formats one line per match,
+  `path:column:row[:value]`, or a JSON object with `--json`. With colors,
+  `writeContent` highlights each match in the value: `Matcher.span` finds
+  it, through `match.indexOf` for literals or `regex.span` for regexes (an
+  anchored run of the VM per candidate start, keeping the longest end;
+  only on values known to match, and not on values over 1 MB).
+- **`-l`**: the first match ends the piece (`record` returns
+  `error.Enough`) and sets the file's `found` flag, so pieces not yet
+  started are skipped. One match anywhere is all `-l` needs.
+- **`--count`**: `record` only counts; `report` adds up the pieces'
+  counts per column, in schema order.
+- **`-m N`**: a piece stops after N matches of its own (no piece can
+  contribute more), and `report` keeps the first N of the file, in order.
+
+`record` reports a row once even if several list elements in it match:
+rows arrive in order, so it remembers the last.
+
+`run` returns a `Summary` (did anything match; did any file fail), which
+`main` turns into the exit status: 0, 1 or 2, as grep.
+
+**Several literals** (`-e a -e b`) stay on the SIMD path: `Matcher` runs
+one pass per literal over a column, marking matching values in a bitset,
+then hands them to the sink once each, in order. A regex alternation
+would have no required literal, so the VM would run on every value
+(1.16 s against 0.27 s for two terms on the benchmark).
+
+For the C API, the sink stores the value's bytes and position instead,
+and `report` turns each one into a `search.Hit`. `c_api.zig` copies a hit
+into one buffer as NUL-terminated `path`, `column` and `text` and calls
+the C callback. A nonzero return sets a flag that every piece and the
+reporter check, so the search stops soon.
 
 `libfds.a` links libc so that its threads are pthreads. Without it, Zig
 creates threads with its own TLS setup, which a C `main` never runs, and

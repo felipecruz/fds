@@ -61,6 +61,22 @@ pub fn contains(comptime case: Case, value: []const u8, term: []const u8) bool {
     return f.found;
 }
 
+/// Where `term` next occurs in `value`, at or after `from`. For
+/// highlighting matches.
+pub fn indexOf(comptime case: Case, value: []const u8, term: []const u8, from: usize) ?usize {
+    const First = struct {
+        pos: ?usize = null,
+        fn onMatch(f: *@This(), p: usize) error{}!?usize {
+            f.pos = p;
+            return null;
+        }
+    };
+    var f: First = .{};
+    if (from > value.len) return null;
+    scan(case, value, term, from, &f) catch unreachable;
+    return f.pos;
+}
+
 // The row whose value holds byte `pos`: the last r >= `from` with
 // off[r] <= pos. Hits arrive in increasing order, so each search starts at
 // the previous row. Requires off[from] <= pos < off[off.len - 1].
@@ -239,6 +255,14 @@ test "SIMD search matches naive search" {
                 const value = data.items[@intCast(off.items[row])..@intCast(off.items[row + 1])];
                 const expected = std.mem.indexOfScalar(usize, naive.items, row) != null;
                 try testing.expectEqual(expected, contains(case, value, term));
+                // indexOf from every start agrees with a plain search.
+                for (0..value.len + 1) |from| {
+                    const want = switch (case) {
+                        .sensitive => std.mem.indexOfPos(u8, value, from, term),
+                        .insensitive => if (std.ascii.findIgnoreCase(value[from..], term)) |p| p + from else null,
+                    };
+                    try testing.expectEqual(want, indexOf(case, value, term, from));
+                }
             }
         }
     }

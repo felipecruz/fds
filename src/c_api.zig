@@ -49,7 +49,7 @@ pub export fn fds_search(
 
     var state: State = .{ .gpa = gpa, .cb = cb orelse return FDS_EARG, .ctx = ctx };
     defer state.buf.deinit(gpa);
-    search.run(gpa, .{
+    _ = search.run(gpa, .{
         .root_path = root_path,
         .term = t,
         .jobs = if (threads == 0) search.autoJobs() else threads,

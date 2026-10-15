@@ -67,7 +67,9 @@ def main():
                                  timeout=LIMIT_SECONDS, preexec_fn=limit_memory)
             peak = peak_bytes()
             problem = None
-            if res.returncode != 0:
+            # 0 or 1 (match or not), or 2 for a file reported as malformed;
+            # anything else (a signal: a panic or crash) is a failure.
+            if res.returncode not in (0, 1, 2) or (res.returncode == 2 and not res.stderr.startswith(b"fds: ")):
                 problem = f"exit {res.returncode}: {res.stderr.decode()[-500:]}"
             elif peak > LIMIT_BYTES:
                 problem = f"used {peak >> 20} MB"

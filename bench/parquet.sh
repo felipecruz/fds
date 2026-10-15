@@ -12,7 +12,8 @@ fi
 zig build
 FDS=zig-out/release/fds
 mkdir -p results
-hyperfine -N --warmup 2 --runs 10 \
+# -i: a search with no match exits 1, as grep does.
+hyperfine -N -i --warmup 2 --runs 10 \
   --export-markdown results/parquet-logs.md --export-json results/parquet-logs.json \
   -n 'snappy rare' "$FDS $DIR/logs.parquet host-4242.example" \
   -n 'snappy none' "$FDS $DIR/logs.parquet zqxjv" \

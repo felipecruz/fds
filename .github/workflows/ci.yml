@@ -25,7 +25,8 @@ jobs:
       - name: C example
         run: zig build c-example -- testdata/tree needle
       - name: Search the test files
-        run: zig-out/release/fds testdata/tree needle
+        # Exit 2: testdata/tree has a truncated file, reported as an error.
+        run: zig-out/release/fds testdata/tree needle || test $? -eq 2
       - name: Static build (musl)
         if: runner.os == 'Linux'
         run: zig build -Dtarget=x86_64-linux-musl && file zig-out/release/fds | grep -q 'statically linked'

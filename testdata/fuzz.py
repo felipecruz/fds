@@ -195,8 +195,10 @@ def main():
         out = subprocess.run(args, capture_output=True, text=True)
         got = set(out.stdout.splitlines())
         total += len(expected)
-        if out.returncode != 0 or out.stderr or got != expected:
-            print(f"MISMATCH iteration {it}: {' '.join(args)} ({settings})")
+        # Exit status: 0 with matches, 1 without, never 2 (no errors here).
+        status_ok = out.returncode == (0 if expected else 1)
+        if not status_ok or out.stderr or got != expected:
+            print(f"MISMATCH iteration {it}: {' '.join(args)} ({settings}), exit {out.returncode}")
             print("schema:", table.schema)
             print("stderr:", out.stderr)
             print("missing:", sorted(expected - got)[:10])

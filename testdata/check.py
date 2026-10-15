@@ -70,7 +70,11 @@ def main():
     out = subprocess.run([fds] + (["-i"] if fold else []) + [root, term], capture_output=True, text=True)
     got = set(out.stdout.splitlines())
     reported = out.stderr.splitlines()
-    ok = got == expected
+    # Exit status: 2 if any file was unreadable, else 0 with matches, else 1.
+    want_status = 2 if bad else (0 if expected else 1)
+    ok = got == expected and out.returncode == want_status
+    if out.returncode != want_status:
+        print(f"exit status {out.returncode}, expected {want_status}")
     for path, why in bad:
         if not any(line.startswith(f"fds: {path}") or path in line for line in reported):
             print(f"not reported by fds: {path} ({why})")

@@ -24,6 +24,9 @@ pub const Options = struct {
     root_path: []const u8,
     /// A literal, or the source of `regex`. Not empty.
     term: []const u8,
+    /// With no regex: several literals, any of which may match (`-e`). If
+    /// empty, just `term`.
+    terms: []const []const u8 = &.{},
     /// Worker threads.
     jobs: usize,
     /// ASCII case-insensitive matching.
@@ -33,6 +36,8 @@ pub const Options = struct {
     /// Search only these columns: a top-level name, or a full path such as
     /// `user.name`. Empty: every string column.
     columns: []const []const u8 = &.{},
+    /// Stop after this many matches in each file (`-m`).
+    max_count: ?u64 = null,
     /// About how many bytes of strings one piece of an Arrow column holds
     /// (see search_arrow.zig). Tests make it small to cut columns finely.
     piece_bytes: usize = 8 << 20,
@@ -51,10 +56,37 @@ pub fn autoJobs() usize {
 }
 
 pub const Output = union(enum) {
-    /// `<path>:<column>:<row>` lines (`:<value>` too with `content`).
-    print: struct { file: Io.File, content: bool = false },
+    /// Printed to a file (stdout); see `Print`.
+    print: Print,
     /// One call per match; see `Callback`.
     callback: Callback,
+};
+
+pub const Print = struct {
+    file: Io.File,
+    mode: Mode = .matches,
+    /// With `.matches`: add the value, `<path>:<column>:<row>:<value>`.
+    content: bool = false,
+    /// JSON Lines instead of `:`-separated text.
+    json: bool = false,
+    /// ANSI colors, and matches highlighted in values.
+    color: bool = false,
+};
+
+pub const Mode = enum {
+    /// One line per match: `<path>:<column>:<row>`.
+    matches,
+    /// One line per file with a match: `<path>` (`-l`).
+    files_with_matches,
+    /// One line per column with matches: `<path>:<column>:<count>`.
+    count,
+};
+
+/// What a search found, for the exit status.
+pub const Summary = struct {
+    matched: bool,
+    /// A file could not be opened or read, or was malformed.
+    errors: bool,
 };
 
 /// Called once per matching (column, row), never concurrently, with the
@@ -84,7 +116,7 @@ pub fn isDataFile(name: []const u8) bool {
 
 /// Searches every data file under `opts.root_path`, or that one file if it
 /// is a file (whatever its name).
-pub fn run(gpa: std.mem.Allocator, opts: Options, output: Output) !void {
+pub fn run(gpa: std.mem.Allocator, opts: Options, output: Output) !Summary {
     // The calling thread only starts the root task and then waits in
     // `group.await`, so all searching happens on the `jobs` pool threads.
     var threaded: Io.Threaded = .init(gpa, .{ .async_limit = .limited(opts.jobs) });
@@ -106,6 +138,7 @@ pub fn run(gpa: std.mem.Allocator, opts: Options, output: Output) !void {
         else => return err,
     }
     if (output == .print) try file_writer.interface.flush();
+    return .{ .matched = searcher.matched.load(.monotonic), .errors = searcher.errors.load(.monotonic) };
 }
 
 pub const Searcher = struct {
@@ -116,6 +149,8 @@ pub const Searcher = struct {
     writer: *Io.Writer, // with `.print` only
     out_mutex: Io.Mutex = .init,
     stopped: std.atomic.Value(bool) = .init(false), // a callback returned false
+    matched: std.atomic.Value(bool) = .init(false),
+    errors: std.atomic.Value(bool) = .init(false),
 
     /// Per-directory-task state, reused for every file in the directory.
     pub const Local = struct {
@@ -140,14 +175,14 @@ pub const Searcher = struct {
     /// Searches one file. Files that can't be read or parsed are reported
     /// on stderr and skipped; matches found before the problem are kept.
     pub fn searchFile(s: *Searcher, dir: Io.Dir, name: []const u8, path: []const u8) !void {
-        const file = dir.openFile(s.io, name, .{}) catch |err| return warn(path, null, err);
+        const file = dir.openFile(s.io, name, .{}) catch |err| return s.warn(path, null, err);
         defer file.close(s.io);
-        const map = Map.open(s.io, s.gpa, file) catch |err| return warn(path, null, err);
+        const map = Map.open(s.io, s.gpa, file) catch |err| return s.warn(path, null, err);
         defer map.close(s.gpa);
         const format: Format = if (parquet.isParquet(map.bytes)) .parquet else .arrow;
         s.searchMap(path, map, format) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
-            else => warn(path, format, err),
+            else => s.warn(path, format, err),
         };
     }
 
@@ -162,7 +197,7 @@ pub const Searcher = struct {
         var f: FileSearch = .{ .s = s, .path = path, .map = map, .format = format };
         defer for (f.pieces.items) |*p| p.deinit(s.gpa);
         // On an error, the pieces planned before it are still searched.
-        const matcher: Matcher = .{ .opts = &s.opts, .vm = if (vm) |*v| v else null };
+        const matcher: Matcher = .{ .opts = &s.opts, .vm = if (vm) |*v| v else null, .arena = arena };
         const plan_err = switch (format) {
             .arrow => search_arrow.plan(&f, arena, matcher),
             .parquet => search_parquet.plan(&f, arena, matcher),
@@ -188,6 +223,8 @@ pub const Searcher = struct {
             inline else => |*j| j.finish(f),
         };
         if (s.stopped.load(.monotonic)) return;
+        // -l: once any piece of the file matched, the rest needn't run.
+        if (s.mode() == .files_with_matches and f.found.load(.monotonic)) return;
         var scratch: std.heap.ArenaAllocator = .init(s.gpa);
         defer scratch.deinit();
         var vm: ?regex.Vm = if (s.opts.regex) |re| regex.Vm.init(s.gpa, re) catch |err| {
@@ -195,33 +232,115 @@ pub const Searcher = struct {
             return;
         } else null;
         defer if (vm) |*v| v.deinit(s.gpa);
-        const matcher: Matcher = .{ .opts = &s.opts, .vm = if (vm) |*v| v else null };
+        const matcher: Matcher = .{ .opts = &s.opts, .vm = if (vm) |*v| v else null, .arena = scratch.allocator() };
         const result = switch (piece.job) {
             inline else => |*j| j.search(scratch.allocator(), f, piece, matcher),
         };
-        result catch |err| {
-            piece.err = err;
+        result catch |err| switch (err) {
+            error.Enough => {}, // the piece found all the matches it may report
+            else => piece.err = err,
         };
     }
 
     // Reports a file's matches in one piece so files never interleave.
+    // Pieces are reported in order, so `-m` keeps the file's first matches.
     fn report(s: *Searcher, f: *FileSearch) !void {
         try s.out_mutex.lock(s.io);
         defer s.out_mutex.unlock(s.io);
+        var left: u64 = s.opts.max_count orelse std.math.maxInt(u64);
+        var counts: std.ArrayList(struct { column: []const u8, n: u64 }) = .empty;
+        defer counts.deinit(s.gpa);
+        var any = false;
         for (f.pieces.items) |*p| {
+            const n = @min(p.count, left);
+            left -= n;
+            any = any or n > 0;
             switch (s.output) {
-                .print => try s.writer.writeAll(p.out.written()),
-                .callback => |cb| for (p.hits.items) |h| {
+                .print => |o| switch (o.mode) {
+                    .matches => try s.writer.writeAll(firstLines(p.out.written(), n)),
+                    .count => {
+                        // Columns in schema order: the order of the pieces.
+                        for (counts.items) |*c| {
+                            if (std.mem.eql(u8, c.column, p.column)) {
+                                c.n += n;
+                                break;
+                            }
+                        } else try counts.append(s.gpa, .{ .column = p.column, .n = n });
+                    },
+                    .files_with_matches => {},
+                },
+                .callback => |cb| for (p.hits.items[0..@intCast(n)]) |h| {
                     if (s.stopped.load(.monotonic)) return;
                     const hit: Hit = .{ .path = f.path, .column = p.column, .row = h.row, .text = p.out.written()[h.start..][0..h.len] };
                     if (!cb.f(cb.ctx, hit)) s.stopped.store(true, .monotonic);
                 },
             }
             // A piece that failed: later pieces are not reported.
-            if (p.err) |err| return warn(f.path, f.format, err);
+            if (p.err) |err| {
+                s.warn(f.path, f.format, err);
+                break;
+            }
+        }
+        if (any) s.matched.store(true, .monotonic);
+        if (s.output != .print) return;
+        const o = s.output.print;
+        const w = s.writer;
+        switch (o.mode) {
+            .matches => {},
+            .files_with_matches => if (any) {
+                if (o.json) {
+                    try w.writeAll("{");
+                    try writeJsonField(w, "path", f.path);
+                    try w.writeAll("}\n");
+                } else {
+                    try w.print("{s}{s}{s}\n", .{ color(o, .path), f.path, color(o, .reset) });
+                }
+            },
+            .count => for (counts.items) |c| {
+                if (c.n == 0) continue;
+                if (o.json) {
+                    try w.writeAll("{");
+                    try writeJsonField(w, "path", f.path);
+                    try w.writeAll(",");
+                    try writeJsonField(w, "column", c.column);
+                    try w.print(",\"count\":{d}}}\n", .{c.n});
+                } else {
+                    try w.print("{s}{s}{s}:{s}{s}{s}:{d}\n", .{ color(o, .path), f.path, color(o, .reset), color(o, .column), c.column, color(o, .reset), c.n });
+                }
+            },
+        }
+    }
+
+    fn mode(s: *const Searcher) Mode {
+        return if (s.output == .print) s.output.print.mode else .matches;
+    }
+
+    /// Reports a file that can't be searched, on stderr.
+    fn warn(s: *Searcher, path: []const u8, format: ?Format, err: anyerror) void {
+        s.errors.store(true, .monotonic);
+        if (builtin.is_test) return; // `zig build test` fails on stderr output
+        const name = if (format) |fm| switch (fm) {
+            .arrow => "Arrow IPC",
+            .parquet => "Parquet",
+        } else "";
+        switch (err) {
+            error.Malformed => std.debug.print("fds: {s}: not a valid {s} file\n", .{ path, name }),
+            error.Unsupported => std.debug.print("fds: {s}: uses a {s} feature fds does not support\n", .{ path, name }),
+            else => std.debug.print("fds: {s}: {t}\n", .{ path, err }),
         }
     }
 };
+
+// The first `n` lines of `text` (each match's output is one line).
+fn firstLines(text: []const u8, n: u64) []const u8 {
+    var end: usize = 0;
+    var k: u64 = 0;
+    while (k < n) : (k += 1) {
+        const nl = std.mem.indexOfScalarPos(u8, text, end, '\n') orelse return text;
+        end = nl + 1;
+    }
+    return text[0..end];
+}
 
 pub const Format = enum { arrow, parquet };
 
@@ -232,6 +351,7 @@ pub const FileSearch = struct {
     map: Map,
     format: Format,
     pieces: std.ArrayList(Piece) = .empty, // in output order
+    found: std.atomic.Value(bool) = .init(false), // some piece matched (for -l)
 
     pub fn addPiece(f: *FileSearch, arena: std.mem.Allocator, job: Job, column: []const u8) !void {
         try f.pieces.append(arena, .{ .job = job, .column = column, .out = .init(f.s.gpa) });
@@ -252,28 +372,54 @@ pub const Piece = struct {
     hits: std.ArrayList(Collected) = .empty, // with `.callback` only
     err: ?anyerror = null,
     last_row: ?u64 = null,
+    count: u64 = 0, // matches recorded
 
     /// Records a match. Rows arrive in order; several matches in one row
-    /// (list elements) are recorded once.
-    pub fn record(p: *Piece, f: *const FileSearch, row: u64, value: []const u8) !void {
+    /// (list elements) are recorded once. Returns error.Enough when the
+    /// piece has recorded all it could ever report, which stops its search.
+    pub fn record(p: *Piece, f: *const FileSearch, matcher: Matcher, row: u64, value: []const u8) !void {
         if (p.last_row == row) return;
         p.last_row = row;
-        const out = &p.out.writer;
-        switch (f.s.output) {
-            .print => |o| {
-                try out.print("{s}:{s}:{d}", .{ f.path, p.column, row });
-                if (o.content) {
-                    try out.writeByte(':');
-                    try writeEscaped(out, value);
-                }
-                try out.writeByte('\n');
+        p.count += 1;
+        const s = f.s;
+        switch (s.output) {
+            .print => |o| switch (o.mode) {
+                .matches => {
+                    const out = &p.out.writer;
+                    if (o.json) {
+                        try out.writeAll("{");
+                        try writeJsonField(out, "path", f.path);
+                        try out.writeAll(",");
+                        try writeJsonField(out, "column", p.column);
+                        try out.print(",\"row\":{d},", .{row});
+                        try writeJsonField(out, "value", value);
+                        try out.writeAll("}\n");
+                    } else {
+                        try out.print("{s}{s}{s}:{s}{s}{s}:{s}{d}{s}", .{
+                            color(o, .path),   f.path,   color(o, .reset),
+                            color(o, .column), p.column, color(o, .reset),
+                            color(o, .row),    row,      color(o, .reset),
+                        });
+                        if (o.content) {
+                            try out.writeByte(':');
+                            try writeContent(out, value, matcher, o.color);
+                        }
+                        try out.writeByte('\n');
+                    }
+                },
+                .count => {},
+                .files_with_matches => {
+                    @constCast(f).found.store(true, .monotonic);
+                    return error.Enough; // one match is all -l needs
+                },
             },
             .callback => {
                 const start = p.out.written().len;
-                try out.writeAll(value);
-                try p.hits.append(f.s.gpa, .{ .row = row, .start = start, .len = value.len });
+                try p.out.writer.writeAll(value);
+                try p.hits.append(s.gpa, .{ .row = row, .start = start, .len = value.len });
             },
         }
+        if (s.opts.max_count) |max| if (p.count >= max) return error.Enough;
     }
 
     fn deinit(p: *Piece, gpa: std.mem.Allocator) void {
@@ -297,32 +443,130 @@ pub fn selected(columns: []const []const u8, top: []const u8, name: []const u8) 
 pub const Matcher = struct {
     opts: *const Options,
     vm: ?*regex.Vm, // with a regex only
+    arena: ?std.mem.Allocator = null, // for several literals
 
     /// Calls `sink.onValue(i, value)` for each matching value of a string
-    /// array given as offsets into back-to-back data.
+    /// array given as offsets into back-to-back data, in order.
     pub fn findValues(m: Matcher, comptime O: type, off: []align(1) const O, data: []const u8, sink: anytype) !void {
         if (m.opts.regex) |re| return regex.findValues(re, m.vm.?, O, off, data, sink);
-        if (m.opts.ignore_case) return match.findValues(.insensitive, O, off, data, m.opts.term, sink);
-        return match.findValues(.sensitive, O, off, data, m.opts.term, sink);
+        const terms = m.literals();
+        if (terms.len == 1) {
+            if (m.opts.ignore_case) return match.findValues(.insensitive, O, off, data, terms[0], sink);
+            return match.findValues(.sensitive, O, off, data, terms[0], sink);
+        }
+        // Several literals: one SIMD pass per term marks the matching
+        // values, then they go to the sink once each, in order.
+        if (off.len < 2) return;
+        var hit = try std.DynamicBitSetUnmanaged.initEmpty(m.arena.?, off.len - 1);
+        for (terms) |t| {
+            const mark: Mark = .{ .bits = &hit };
+            if (m.opts.ignore_case) try match.findValues(.insensitive, O, off, data, t, mark) else try match.findValues(.sensitive, O, off, data, t, mark);
+        }
+        var it = hit.iterator(.{});
+        while (it.next()) |i| try sink.onValue(i, data[@intCast(off[i])..@intCast(off[i + 1])]);
+    }
+
+    const Mark = struct {
+        bits: *std.DynamicBitSetUnmanaged,
+        pub fn onValue(k: Mark, i: usize, _: []const u8) !void {
+            k.bits.set(i);
+        }
+    };
+
+    fn literals(m: Matcher) []const []const u8 {
+        return if (m.opts.terms.len > 0) m.opts.terms else (&m.opts.term)[0..1];
     }
 
     /// Does one value match?
     pub fn matches(m: Matcher, value: []const u8) bool {
         if (m.opts.regex) |re| return regex.matches(re, m.vm.?, value);
-        if (m.opts.ignore_case) return match.contains(.insensitive, value, m.opts.term);
-        return match.contains(.sensitive, value, m.opts.term);
+        for (m.literals()) |t| {
+            if (if (m.opts.ignore_case) match.contains(.insensitive, value, t) else match.contains(.sensitive, value, t)) return true;
+        }
+        return false;
+    }
+
+    /// The next match in `value` at or after `from`, as [start, end), for
+    /// highlighting.
+    pub fn span(m: Matcher, value: []const u8, from: usize) ?[2]usize {
+        if (m.opts.regex) |re| return regex.span(m.vm.?, re, value, from);
+        // The earliest occurrence of any literal; the longest one there.
+        var best: ?[2]usize = null;
+        for (m.literals()) |t| {
+            const at = (if (m.opts.ignore_case) match.indexOf(.insensitive, value, t, from) else match.indexOf(.sensitive, value, t, from)) orelse continue;
+            if (best == null or at < best.?[0] or (at == best.?[0] and at + t.len > best.?[1])) best = .{ at, at + t.len };
+        }
+        return best;
     }
 
     /// Could any value stored somewhere in `bytes` match? False only if the
     /// term (or the regex's required literal) appears nowhere in them, so
     /// a page of values can be skipped without decoding it.
     pub fn mayMatch(m: Matcher, bytes: []const u8) bool {
-        const literal = if (m.opts.regex) |re| re.literal else m.opts.term;
-        if (literal.len == 0) return true;
-        const fold = if (m.opts.regex) |re| re.ignore_case else m.opts.ignore_case;
-        return if (fold) match.contains(.insensitive, bytes, literal) else match.contains(.sensitive, bytes, literal);
+        if (m.opts.regex) |re| {
+            if (re.literal.len == 0) return true;
+            return if (re.ignore_case) match.contains(.insensitive, bytes, re.literal) else match.contains(.sensitive, bytes, re.literal);
+        }
+        return m.matches(bytes); // any literal anywhere in the bytes
     }
 };
+
+const Color = enum { path, column, row, match, reset };
+
+// ANSI colors, as ripgrep uses them: paths magenta, positions green,
+// matches bold red; columns cyan.
+fn color(o: Print, c: Color) []const u8 {
+    if (!o.color) return "";
+    return switch (c) {
+        .path => "\x1b[35m",
+        .column => "\x1b[36m",
+        .row => "\x1b[32m",
+        .match => "\x1b[1;31m",
+        .reset => "\x1b[0m",
+    };
+}
+
+// The value of a `--content` line, its matches highlighted with color.
+// Values over 1 MB are printed plain: finding regex spans is not linear.
+fn writeContent(w: *Io.Writer, value: []const u8, matcher: Matcher, colored: bool) !void {
+    if (!colored or value.len > 1 << 20) return writeEscaped(w, value);
+    var at: usize = 0;
+    while (matcher.span(value, at)) |sp| {
+        try writeEscaped(w, value[at..sp[0]]);
+        if (sp[1] == sp[0]) { // an empty match: nothing to color
+            if (sp[0] == value.len) break;
+            try writeEscaped(w, value[sp[0] .. sp[0] + 1]);
+            at = sp[0] + 1;
+            continue;
+        }
+        try w.writeAll("\x1b[1;31m");
+        try writeEscaped(w, value[sp[0]..sp[1]]);
+        try w.writeAll("\x1b[0m");
+        at = sp[1];
+    }
+    try writeEscaped(w, value[at..]);
+}
+
+// `"key":"value"`, or `"key_base64":"..."` when the bytes are not UTF-8
+// (JSON strings can't hold arbitrary bytes), as ripgrep does.
+fn writeJsonField(w: *Io.Writer, key: []const u8, bytes: []const u8) !void {
+    if (!std.unicode.utf8ValidateSlice(bytes)) {
+        try w.print("\"{s}_base64\":\"", .{key});
+        try std.base64.standard.Encoder.encodeWriter(w, bytes);
+        return w.writeByte('"');
+    }
+    try w.print("\"{s}\":\"", .{key});
+    for (bytes) |c| switch (c) {
+        '"' => try w.writeAll("\\\""),
+        '\\' => try w.writeAll("\\\\"),
+        '\n' => try w.writeAll("\\n"),
+        '\r' => try w.writeAll("\\r"),
+        '\t' => try w.writeAll("\\t"),
+        0...8, 11, 12, 14...0x1f, 0x7f => try w.print("\\u{x:0>4}", .{c}),
+        else => try w.writeByte(c),
+    };
+    try w.writeByte('"');
+}
 
 // A value on one output line: newlines and carriage returns as \n and \r.
 fn writeEscaped(w: *Io.Writer, value: []const u8) !void {
@@ -333,19 +577,6 @@ fn writeEscaped(w: *Io.Writer, value: []const u8) !void {
         rest = rest[i + 1 ..];
     }
     try w.writeAll(rest);
-}
-
-fn warn(path: []const u8, format: ?Format, err: anyerror) void {
-    if (builtin.is_test) return; // `zig build test` fails on stderr output
-    const name = if (format) |f| switch (f) {
-        .arrow => "Arrow IPC",
-        .parquet => "Parquet",
-    } else "";
-    switch (err) {
-        error.Malformed => std.debug.print("fds: {s}: not a valid {s} file\n", .{ path, name }),
-        error.Unsupported => std.debug.print("fds: {s}: uses a {s} feature fds does not support\n", .{ path, name }),
-        else => std.debug.print("fds: {s}: {t}\n", .{ path, err }),
-    }
 }
 
 const testing = std.testing;
@@ -374,7 +605,7 @@ const CollectHits = struct {
 fn expectHits(opts: Options, expected: []const []const u8) !void {
     var c: CollectHits = .{ .gpa = testing.allocator };
     defer c.deinit();
-    try run(testing.allocator, opts, .{ .callback = .{ .ctx = &c, .f = CollectHits.onHit } });
+    _ = try run(testing.allocator, opts, .{ .callback = .{ .ctx = &c, .f = CollectHits.onHit } });
     std.mem.sort([]const u8, c.hits.items, {}, CollectHits.lessThan);
     try testing.expectEqual(expected.len, c.hits.items.len);
     for (expected, c.hits.items) |e, h| try testing.expectEqualStrings(e, h);
@@ -454,4 +685,77 @@ test "search one file: columns, case, regex" {
         file ++ ":user.name:4:needles",
         file ++ ":view:3:needle",
     });
+}
+
+// Runs a search printing into a file, and returns what it printed.
+fn printed(opts: Options, print: Print) !struct { text: []u8, summary: Summary } {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(testing.io, "out", .{ .read = true });
+    var p = print;
+    p.file = file;
+    const summary = try run(testing.allocator, opts, .{ .print = p });
+    file.close(testing.io);
+    return .{ .text = try tmp.dir.readFileAlloc(testing.io, "out", testing.allocator, .unlimited), .summary = summary };
+}
+
+test "output modes: -l, --count, -m, --json, colors; the summary" {
+    const file = "testdata/tree/plain.arrow";
+    const one: Options = .{ .root_path = file, .term = "needle", .jobs = 2 };
+    const anyfile: Print = .{ .file = undefined };
+
+    var r = try printed(one, .{ .file = undefined, .mode = .files_with_matches });
+    try testing.expectEqualStrings(file ++ "\n", r.text);
+    testing.allocator.free(r.text);
+
+    r = try printed(.{ .root_path = file, .term = "needle", .jobs = 2, .columns = &.{ "name", "note", "tags" } }, .{ .file = undefined, .mode = .count });
+    try testing.expectEqualStrings(file ++ ":name:2\n" ++ file ++ ":note:1\n" ++ file ++ ":tags[]:2\n", r.text);
+    testing.allocator.free(r.text);
+
+    // -m: the file's first matches in output order (batch, column, row).
+    r = try printed(.{ .root_path = file, .term = "needle", .jobs = 4, .max_count = 3 }, anyfile);
+    try testing.expectEqualStrings(file ++ ":name:0\n" ++ file ++ ":view:1\n" ++ file ++ ":view:3\n", r.text);
+    testing.allocator.free(r.text);
+
+    r = try printed(.{ .root_path = file, .term = "needle", .jobs = 1, .columns = &.{"note"} }, .{ .file = undefined, .json = true });
+    try testing.expectEqualStrings("{\"path\":\"" ++ file ++ "\",\"column\":\"note\",\"row\":4,\"value\":\"needle\\nline\"}\n", r.text);
+    testing.allocator.free(r.text);
+
+    r = try printed(.{ .root_path = file, .term = "needle", .jobs = 1, .columns = &.{"note"} }, .{ .file = undefined, .content = true, .color = true });
+    try testing.expectEqualStrings("\x1b[35m" ++ file ++ "\x1b[0m:\x1b[36mnote\x1b[0m:\x1b[32m4\x1b[0m:\x1b[1;31mneedle\x1b[0m\\nline\n", r.text);
+    try testing.expect(r.summary.matched and !r.summary.errors);
+    testing.allocator.free(r.text);
+
+    // Nothing found: not matched. A malformed file: an error.
+    r = try printed(.{ .root_path = file, .term = "zqxjv", .jobs = 1 }, anyfile);
+    try testing.expect(!r.summary.matched and !r.summary.errors);
+    testing.allocator.free(r.text);
+    r = try printed(.{ .root_path = "testdata/tree", .term = "needle", .jobs = 4 }, .{ .file = undefined, .mode = .files_with_matches });
+    try testing.expect(r.summary.matched and r.summary.errors); // truncated.arrow
+    testing.allocator.free(r.text);
+}
+
+test "highlighting and JSON escaping" {
+    var buf: [256]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    const lit: Options = .{ .root_path = "", .term = "ab", .jobs = 1 };
+    try writeContent(&w, "xabyab\nab", .{ .opts = &lit, .vm = null }, true);
+    try testing.expectEqualStrings("x\x1b[1;31mab\x1b[0my\x1b[1;31mab\x1b[0m\\n\x1b[1;31mab\x1b[0m", w.buffered());
+
+    var re = try regex.Regex.compile(testing.allocator, "b*", false);
+    defer re.deinit();
+    var vm = try regex.Vm.init(testing.allocator, &re);
+    defer vm.deinit(testing.allocator);
+    const rx: Options = .{ .root_path = "", .term = "b*", .jobs = 1, .regex = &re };
+    w = .fixed(&buf);
+    // Empty matches between the b's must not loop forever.
+    try writeContent(&w, "abba", .{ .opts = &rx, .vm = &vm }, true);
+    try testing.expectEqualStrings("a\x1b[1;31mbb\x1b[0ma", w.buffered());
+
+    w = .fixed(&buf);
+    try writeJsonField(&w, "v", "q\"\\\x01é");
+    try testing.expectEqualStrings("\"v\":\"q\\\"\\\\\\u0001é\"", w.buffered());
+    w = .fixed(&buf);
+    try writeJsonField(&w, "v", "\xff\xfe");
+    try testing.expectEqualStrings("\"v_base64\":\"//4=\"", w.buffered());
 }

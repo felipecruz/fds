@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **Exit status as in grep:** 0 if something matched, 1 if nothing did, 2
+  on any error.
+- `-l` / `--files-with-matches`, `--count` (`path:column:count`) and
+  `-m N` / `--max-count` (per file). `-l` and `-m` stop searching early:
+  `-l` finds a common term in a 2.3 GB file in 5 ms.
+- `--json`: JSON Lines, `{"path","column","row","value"}`; values that
+  aren't UTF-8 as `value_base64`.
+- `-w` (whole words), `-e` (several terms; literals stay on the SIMD path,
+  one pass each) and `-S` (smart case).
+- Colors, and matches highlighted in `--content` output, on a terminal
+  (`--color auto|always|never`; `NO_COLOR` is honored).
 - **Parquet support.** `.parquet` files are searched too: string columns
   (STRING, ENUM, JSON), at the top level or in structs. Snappy, gzip, zstd,
   LZ4 (raw and Hadoop); data pages v1 and v2; PLAIN, dictionary,

@@ -27,7 +27,7 @@ pub const Job = struct {
     first_row: u64, // file row of the row group's first row
 
     pub fn search(job: *Job, arena: Allocator, f: *const FileSearch, piece: *Piece, matcher: Matcher) !void {
-        try parquet.searchChunk(arena, job.chunk, job.column, matcher, Sink{ .f = f, .piece = piece, .first_row = job.first_row });
+        try parquet.searchChunk(arena, job.chunk, job.column, matcher, Sink{ .f = f, .piece = piece, .matcher = matcher, .first_row = job.first_row });
     }
 
     /// Each chunk is its own part of the file: release it right away.
@@ -39,9 +39,10 @@ pub const Job = struct {
 const Sink = struct {
     f: *const FileSearch,
     piece: *Piece,
+    matcher: Matcher,
     first_row: u64,
 
     pub fn onValue(k: Sink, row: usize, value: []const u8) !void {
-        try k.piece.record(k.f, k.first_row + row, value);
+        try k.piece.record(k.f, k.matcher, k.first_row + row, value);
     }
 };
